@@ -54,6 +54,10 @@ class Leg:
         return self.price if self.intent == BUY_LONG else 1 - self.price
 
 
+def _f(x) -> str:
+    return "  -- " if x is None else f"{x:.3f}"
+
+
 def plan_entry(kb, pb, fair: float, cfg: PairConfig):
     """Best pairing of two resting maker bids, or None. kb/pb are the two venues' YES books.
     Combo A: Up bid at Kalshi's best bid + Down bid at Polymarket's best Down bid (= YES ask). Combo B: the reverse."""
@@ -170,8 +174,8 @@ class PairMaker:
             plan = plan_entry(kb, pb, fair, c) if quoting and abs(net[K]) < 1e-9 and abs(net[P]) < 1e-9 else None
             self._sync_orders(plan)
             if now - self._last_log > 10:
-                log.info("T-%4.0fs fair %.3f | K %.3f/%.3f  P %.3f/%.3f | %s", m.window_end - now, fair, kb.best_bid, kb.best_ask,
-                         pb.best_bid, pb.best_ask, f"PAIR {plan[1]} margin {plan[0] * 100:.1f}c" if plan else "no pair (margin/zone)")
+                log.info("T-%4.0fs fair %.3f | K %s/%s  P %s/%s | %s", m.window_end - now, fair, _f(kb.best_bid), _f(kb.best_ask),
+                         _f(pb.best_bid), _f(pb.best_ask), f"PAIR {plan[1]} margin {plan[0] * 100:.1f}c" if plan else "no pair (margin/zone)")
                 self._last_log = now
 
     def _sync_orders(self, plan) -> None:

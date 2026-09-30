@@ -99,3 +99,8 @@ def test_lone_leg_is_held_if_exit_would_dump_far_below_fair():
     m.brokers[K].pos = 1.0
     m._exit_lone_leg({K: 1.0, P: 0.0}, 0.60, book(0.20, 0.21), book(0.20, 0.21))   # bid 0.20 vs fair 0.60: model says hold
     assert m.brokers[K].pos == 1.0
+
+
+def test_log_formatting_handles_a_missing_side_of_the_book():
+    from polymarket_mm.pairmaker15 import _f
+    assert _f(None).strip() == "--" and _f(0.3) == "0.300"

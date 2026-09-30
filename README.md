@@ -44,8 +44,16 @@ Your funder wallet needs USDC on Polygon and the Polymarket exchange allowances 
 | Max USDC committed to resting buys | `MM_MAX_OPEN_NOTIONAL` |
 | Pull quotes if mid jumps between cycles | `MM_MOVE_PAUSE` |
 | Pull quotes on empty / wide books | `MM_MAX_BOOK_SPREAD` |
+| Pull BTC-market quotes on a fast BRTI move or stale BRTI feed (needs Kalshi key) | `MM_BTC_MOVE_PAUSE`, `MM_BTC_WINDOW` |
 | Cancel all + exit after repeated API failures | `MM_MAX_ERRORS` |
 | Cancel this bot's quotes on Ctrl-C / SIGTERM | always |
+
+## BRTI feed (optional)
+
+Set `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` in `.env` and the bot streams BRTI from Kalshi
+(`polymarket_mm/brti.py`). Markets mentioning bitcoin/BTC then pause when BRTI moves more than
+`MM_BTC_MOVE_PAUSE` within `MM_BTC_WINDOW` seconds, or if the feed is stale. Check the feed alone with
+`python -m polymarket_mm.brti_cli -v`.
 
 ## Limitations - read before going live
 

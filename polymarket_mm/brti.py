@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,6 +122,7 @@ class BrtiFeed:
     def __init__(self, auth: KalshiAuth, index_id: str = "BRTI", url: str = WS_URL, stale_after: float = 5.0):
         self.auth, self.index_id, self.url, self.stale_after = auth, index_id, url, stale_after
         self._tick: BrtiTick | None = None
+        self._history: deque[tuple[float, float]] = deque(maxlen=600)  # (local_ts, price)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -133,6 +135,18 @@ class BrtiFeed:
         if t is None or time.time() - t.local_ts > self.stale_after:
             return None
         return t
+
+    def move(self, window: float) -> float | None:
+        """Absolute fractional BRTI change over the last `window` seconds (None if not enough data)."""
+        with self._lock:
+            hist = list(self._history)
+        if not hist:
+            return None
+        now_ts, now_px = hist[-1]
+        old = [px for ts, px in hist if ts >= now_ts - window]
+        if len(old) < 2 or now_ts - hist[0][0] < window / 2:
+            return None
+        return abs(now_px - old[0]) / old[0]
 
     def start(self) -> None:
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True, name="brti-feed")
@@ -168,7 +182,10 @@ class BrtiFeed:
                 if tick is None:
                     log.debug("non-tick frame: %.200s", raw)
                     continue
+                px = tick.spot if tick.spot is not None else tick.avg_60s
                 with self._lock:
                     self._tick = tick
+                    if px:
+                        self._history.append((tick.local_ts, px))
                 if self.on_tick:
                     self.on_tick(tick)

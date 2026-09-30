@@ -93,3 +93,42 @@ def test_run_selects_markets_on_first_iteration(monkeypatch):
     bot.stop.wait = lambda _s: (placed.extend(b.open_orders("0xabc")), bot.stop.set())
     assert bot.run() == 0
     assert calls == [1] and len(placed) == 2
+
+
+class FakeBrti:
+    def __init__(self, tick=object(), move=None):
+        self.tick, self._move = tick, move
+
+    def latest(self):
+        return self.tick
+
+    def move(self, window):
+        return self._move
+
+
+BTC = Market("Bitcoin above $70k?", "0xbtc", "Y", "N", 0.5, 5, 0.01, None, 1e5)
+
+
+def btc_bot(brti):
+    b = DryRunBroker()
+    return MarketMaker(Config(), FakeClob(), b, [BTC, M], brti=brti), b
+
+
+def test_btc_market_quotes_when_brti_calm():
+    bot, b = btc_bot(FakeBrti(move=0.0002))
+    bot.cycle()
+    assert len(b.open_orders("0xbtc")) == 2
+
+
+def test_btc_market_pulled_on_brti_spike_but_others_unaffected():
+    bot, b = btc_bot(FakeBrti(move=0.0002))
+    bot.cycle()
+    bot.brti._move = 0.01
+    bot.cycle()
+    assert b.open_orders("0xbtc") == [] and len(b.open_orders("0xabc")) == 2
+
+
+def test_btc_market_pulled_when_feed_stale():
+    bot, b = btc_bot(FakeBrti(tick=None))
+    bot.cycle()
+    assert b.open_orders("0xbtc") == [] and len(b.open_orders("0xabc")) == 2

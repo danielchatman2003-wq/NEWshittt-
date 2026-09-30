@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import signal
 import sys
 
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 
 from .bot import MarketMaker
 from .broker import DryRunBroker, LiveBroker, make_live_client, make_public_client
+from .brti import BrtiFeed, KalshiAuth
 from .config import Config, Credentials
 
 
@@ -33,7 +35,15 @@ def main() -> int:
         clob, broker = make_public_client(), DryRunBroker()
         log.info("DRY-RUN: reading real books, no orders will be placed (pass --live to trade)")
 
-    bot = MarketMaker(cfg, clob, broker)
+    brti = None
+    if os.getenv("KALSHI_API_KEY_ID"):
+        brti = BrtiFeed(KalshiAuth.from_env())
+        brti.start()
+        log.info("BRTI guard on: BTC markets pause on fast BRTI moves or a stale feed")
+    else:
+        log.info("no KALSHI_API_KEY_ID set: running without the BRTI guard")
+
+    bot = MarketMaker(cfg, clob, broker, brti=brti)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: bot.stop.set())
     return bot.run()

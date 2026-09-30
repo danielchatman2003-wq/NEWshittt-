@@ -18,6 +18,8 @@ class Config:
     move_pause: float = 0.03
     refresh_seconds: float = 15.0
     max_errors: int = 5
+    btc_move_pause: float = 0.0015  # BRTI move (fraction) within btc_window that pulls BTC quotes
+    btc_window: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Config":

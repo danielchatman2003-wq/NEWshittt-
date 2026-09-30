@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import time
 
@@ -10,6 +11,7 @@ from .quoter import Quote, compute_quotes
 log = logging.getLogger(__name__)
 RESELECT_SECONDS = 1800
 REWARD_SPREAD_MARGIN = 0.9  # stay comfortably inside the rewards spread
+BTC_RE = re.compile(r"\b(bitcoin|btc)\b", re.I)
 
 
 def best_prices(book) -> tuple[float | None, float | None]:
@@ -20,8 +22,8 @@ def best_prices(book) -> tuple[float | None, float | None]:
 
 
 class MarketMaker:
-    def __init__(self, cfg: Config, clob, broker, markets: list[Market] | None = None):
-        self.cfg, self.clob, self.broker = cfg, clob, broker
+    def __init__(self, cfg: Config, clob, broker, markets: list[Market] | None = None, brti=None):
+        self.cfg, self.clob, self.broker, self.brti = cfg, clob, broker, brti
         self.markets = markets if markets is not None else []
         self.stop = threading.Event()
         self._prev_mid: dict[str, float] = {}
@@ -43,8 +45,24 @@ class MarketMaker:
             and abs(o["size"] - q.size) <= max(1.0, 0.25 * q.size)
         )
 
+    def _brti_unsafe(self, m: Market) -> str | None:
+        """Reason to pull quotes on a BTC market based on the BRTI feed, else None."""
+        if self.brti is None or not BTC_RE.search(m.question):
+            return None
+        if self.brti.latest() is None:
+            return "BRTI feed stale/unavailable"
+        mv = self.brti.move(self.cfg.btc_window)
+        if mv is not None and mv > self.cfg.btc_move_pause:
+            return f"BRTI moved {mv:.3%} in {self.cfg.btc_window:.0f}s"
+        return None
+
     def _quote_market(self, m: Market, notional_left: float) -> float:
         """Reconcile resting orders for one market. Returns BUY notional committed."""
+        why = self._brti_unsafe(m)
+        if why:
+            log.info("pulling quotes, %s: %s", why, m.question[:50])
+            self.broker.cancel_market(m.condition_id)
+            return 0.0
         book = self.clob.get_order_book(m.yes_token)
         bid, ask = best_prices(book)
         if bid is None or ask is None or ask - bid > self.cfg.max_book_spread:

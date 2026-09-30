@@ -70,3 +70,11 @@ def test_latest_goes_stale():
     assert f.latest() is not None
     f._tick = type(f._tick)(**{**f._tick.__dict__, "local_ts": f._tick.local_ts - 10})
     assert f.latest() is None
+
+
+def test_move_over_window():
+    f = BrtiFeed(KalshiAuth("k", pem(ed25519.Ed25519PrivateKey.generate())))
+    assert f.move(30) is None
+    for i, px in enumerate([100.0, 100.0, 101.0]):
+        f._history.append((1000.0 + i * 20, px))  # 40s of data
+    assert abs(f.move(30) - 0.01) < 1e-9

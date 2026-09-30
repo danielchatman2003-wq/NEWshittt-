@@ -20,7 +20,7 @@ from validate import CACHE, slug_for  # noqa: E402
 FEE = 0.0695
 
 
-def main():
+def build_cands():
     s0, g = bt.load()
     gf = bt.ffill(g)
     wins = bt.windows(g, s0)
@@ -55,6 +55,11 @@ def main():
             fair = fair_up(spot=gf[t - s0], k=ptb, now=t, window_end=t_end, sigma=smp.sigma(t), sampler=smp)
             rows.append((t_end - t, fair, up[j], dn[j]))
         cands.append((w["up"], rows))
+    return cands
+
+
+def main():
+    cands = build_cands()
     rng = np.random.default_rng(7)
     print(f"{'theta':>6} {'margin':>7} {'trades':>7} {'win%':>6} {'avg cost':>9} {'net/contract':>13}   95% CI              worst  losers")
     for theta in (0.90, 0.95, 0.97, 0.99):

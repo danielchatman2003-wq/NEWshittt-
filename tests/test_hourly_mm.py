@@ -374,3 +374,30 @@ def test_rest_retries_reads_but_never_retries_order_creation():
     except requests.ConnectionError:
         pass
     assert s2.calls == 1
+
+
+def test_exit_quote_priced_at_or_below_fair_is_not_replaced_every_cycle():
+    """Regression (seen live: 46 placements in 25s): an exit deliberately priced at/below fair has ~0 'edge'."""
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("x", SELL_LONG, 0.30, 1.0)])
+    for _ in range(20):                                   # twenty loop iterations, fair hovering at the order's price
+        m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.301, half=0.02)
+    assert m.broker.cancelled == [] and m.broker.placed == []
+
+
+def test_resting_order_more_aggressive_than_desired_is_replaced_but_one_tick_passive_is_kept():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    # ask-like: desired 0.30. resting 0.29 is MORE aggressive (gives edge away) -> replace
+    m = _maker([RestingOrder("a", SELL_LONG, 0.29, 1.0)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    assert m.broker.cancelled == ["a"]
+    # resting 0.31 is one tick more passive -> keep
+    m = _maker([RestingOrder("b", SELL_LONG, 0.31, 1.0)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    assert m.broker.cancelled == [] and m.broker.placed == []
+    # two ticks more passive -> replace
+    m = _maker([RestingOrder("c", SELL_LONG, 0.32, 1.0)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    assert m.broker.cancelled == ["c"]

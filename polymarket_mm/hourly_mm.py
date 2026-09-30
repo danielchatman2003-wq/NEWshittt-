@@ -218,17 +218,21 @@ class HourlyMaker:
                  m.slug, end_avg, k, "UP" if up else "DOWN", fills, pnl, self.total_pnl)
 
     def _reconcile(self, want: list[DesiredQuote], tick: float, fair: float, half: float) -> None:
-        """Make resting orders match `want`, without churning: an order is kept while it is within one tick of
-        the desired price AND still earns at least half the target edge. Anything else is cancelled and replaced,
-        so quotes follow fair value as it moves but a 1-cent wiggle doesn't burn the rate limit."""
+        """Make resting orders match `want` without churning. A resting order is kept while it sits where we would
+        put it now, allowing it to be up to ONE tick more passive than desired (a 1-cent wiggle doesn't burn the
+        rate limit or our queue spot) but never MORE aggressive than desired (it would be giving edge away).
+        Judged against the desired price only: exit quotes are deliberately priced at/below fair to shed inventory,
+        so an 'edge vs fair' test would wrongly replace them every cycle."""
         have = self.broker.open_orders()
         keep_ids, todo = set(), list(want)
+        eps = tick * 0.01
         for o in have:
             for q in todo:
                 if q.intent != o.intent or not (0.5 * q.qty <= o.qty <= q.qty + 1e-9):
                     continue
-                edge = (fair - o.price) if o.intent in (BUY_LONG, SELL_SHORT) else (o.price - fair)
-                if abs(q.price - o.price) <= tick * 1.01 and edge >= 0.5 * half:
+                bidlike = o.intent in (BUY_LONG, SELL_SHORT)          # rests below the market in YES-price space
+                passive_by = (q.price - o.price) if bidlike else (o.price - q.price)   # >0: resting is more passive
+                if -eps <= passive_by <= tick + eps:
                     todo.remove(q)
                     keep_ids.add(o.id)
                     break

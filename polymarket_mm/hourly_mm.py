@@ -38,8 +38,8 @@ class HourlyConfig:
     start_delay: float = 900.0    # no quoting for the first 15 min: backtest shows the model is no better than the market there
                                   # (Brier 0.2368 vs 0.2350) and clearly better later, so early quotes just get picked off
     stop_before_end: float = 150.0  # stop quoting this long before expiry (gamma blows up)
-    min_p: float = 0.06           # don't quote near-certain outcomes
-    max_p: float = 0.94
+    min_p: float = 0.10           # don't quote outside 10/90: one side is a lottery ticket, the other risks 90c+ to win <10c,
+    max_p: float = 0.90           # and a 1c tick is >10% of the price, so only ONE side ever fills (seen live: Up-only at fair 0.07)
     warmup_samples: int = 180     # seconds of BRTI history needed before trusting the vol estimate
     spike_sigmas: float = 3.0     # 10s BRTI move (in sigmas) that halts quoting
     halt_seconds: float = 10.0

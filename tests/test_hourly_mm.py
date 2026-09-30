@@ -592,3 +592,12 @@ def test_blocked_direction_is_not_quoted_but_exits_and_other_side_still_are():
     assert q == {SELL_LONG}                       # a held Up can still be exited
     q = {x.intent for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=0.0, cfg=cfg, block_up=True, block_down=True)}
     assert q == set()
+
+
+def test_no_quoting_in_the_extreme_zones_where_only_one_side_can_fill():
+    cfg = HourlyConfig()
+    assert cfg.min_p >= 0.10 and cfg.max_p <= 0.90
+    for f in (0.05, 0.07, 0.93, 0.97):
+        assert not (cfg.min_p <= f <= cfg.max_p)
+    for f in (0.15, 0.5, 0.85):
+        assert cfg.min_p <= f <= cfg.max_p

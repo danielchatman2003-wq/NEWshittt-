@@ -28,8 +28,8 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class HourlyConfig:
-    size: float = 10.0            # contracts per quote
-    max_pos: float = 50.0         # max net contracts either way
+    size: float = 1.0             # contracts per quote (1 per trade)
+    max_pos: float = 3.0          # max net contracts either way
     min_half: float = 0.02        # minimum half-spread (probability units)
     skew: float = 0.03            # fair-value shift at max inventory
     react_seconds: float = 5.0    # widen by the fair-value move possible in this long

@@ -4,7 +4,7 @@ from polymarket_mm.hourly_mm import HourlyConfig, yes_quotes
 from polymarket_mm.us_broker import (BUY_LONG, BUY_SHORT, SELL_LONG, SELL_SHORT, PaperBroker, RateLimiter,
                                      order_body)
 
-CFG = HourlyConfig(size=10, max_pos=50, skew=0.03)
+CFG = HourlyConfig(size=10, max_pos=50, skew=0.03)  # explicit sizes: tests the logic, not the live defaults
 
 
 def q(pos=0.0, fair=0.50, half=0.02, cfg=CFG):
@@ -86,3 +86,22 @@ def test_rate_limiter_paces_requests():
     for _ in range(5):
         rl.acquire()
     assert time.monotonic() - t >= 0.15    # 4 waits of ~50ms
+
+
+def test_live_defaults_are_one_contract():
+    d = HourlyConfig()
+    assert d.size == 1.0 and d.max_pos <= 3.0
+
+
+def test_up_and_down_are_exactly_symmetric():
+    """P(Down) = 1 - P(Up): mirroring the state must mirror the quotes (nothing is Up-biased)."""
+    from polymarket_mm.model import fair_up
+    for d in (5, 40, 150, 400):
+        up = fair_up(spot=84000 + d, k=84000, now=0, window_end=3000, sigma=6)
+        dn = fair_up(spot=84000 - d, k=84000, now=0, window_end=3000, sigma=6)
+        assert abs(up + dn - 1) < 1e-9
+    a = {x.intent: x for x in yes_quotes(fair=0.7, half=0.02, tick=0.01, pos=0, cfg=CFG)}
+    b = {x.intent: x for x in yes_quotes(fair=0.3, half=0.02, tick=0.01, pos=0, cfg=CFG)}
+    # buying Up at x is the mirror of buying Down at x: bid(Up)@0.68 <-> ask side BUY_SHORT@0.32 -> Down price 0.68
+    assert abs(a[BUY_LONG].price - (1 - b[BUY_SHORT].price)) < 1e-9
+    assert abs(a[BUY_SHORT].price - (1 - b[BUY_LONG].price)) < 1e-9

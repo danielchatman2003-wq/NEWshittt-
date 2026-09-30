@@ -90,7 +90,7 @@ def main():
     print("== (2) Model vs the MARKET's own price, same moments (walk-forward, no lookahead) ==")
     sig = bt.sigma_series(gf, 10, 900, 6.0, 300)
     offs = np.arange(15, bt.HOUR - 150 + 1, 30)
-    P, M, Y, T = [], [], [], []
+    P, M, Y, T, W = [], [], [], [], []
     for w, slug, ptb in usable:
         try:
             hist = get_cached("h_" + slug, lambda: _hist(rest, slug, w["t0"]))
@@ -103,11 +103,11 @@ def main():
         p = stats.norm.cdf((gf[idx] - ptb) / sd)       # use the EXCHANGE's reference price for a clean comparison
         mk = market_series(hist, offs, w["t0"])
         ok = ~np.isnan(mk)
-        P.append(p[ok]); M.append(mk[ok]); Y.append(np.full(ok.sum(), w["up"])); T.append(offs[ok])
+        P.append(p[ok]); M.append(mk[ok]); Y.append(np.full(ok.sum(), w["up"])); T.append(offs[ok]); W.append(np.full(ok.sum(), len(W)))
     if not P:
         print("  no overlapping market history")
         return
-    P, M, Y, T = map(np.concatenate, (P, M, Y, T))
+    P, M, Y, T, W = map(np.concatenate, (P, M, Y, T, W))
     nw = len(usable)
     print(f"  {len(P)} comparison points from {nw} windows")
     print(f"  Brier  model {bt.brier(P, Y):.4f}   market {bt.brier(M, Y):.4f}   coin-flip 0.2500")
@@ -115,6 +115,22 @@ def main():
     for a, b in ((0, 900), (900, 1800), (1800, 2700), (2700, 3451)):
         m = (T >= a) & (T < b)
         print(f"    {a // 60:2d}-{b // 60:2d} min:  model {bt.brier(P[m], Y[m]):.4f}   market {bt.brier(M[m], Y[m]):.4f}")
+    # resample whole WINDOWS (points inside a window are highly correlated) to see if the gap is real
+    rng, nwin = np.random.default_rng(0), int(W.max()) + 1
+    def boot(mask, label):
+        d = (P - Y) ** 2 - (M - Y) ** 2                     # <0 => model better
+        per = np.array([d[(W == i) & mask].mean() if ((W == i) & mask).any() else np.nan for i in range(nwin)])
+        per = per[~np.isnan(per)]
+        means = [per[rng.integers(0, len(per), len(per))].mean() for _ in range(3000)]
+        lo, hi = np.percentile(means, [2.5, 97.5])
+        print(f"  Brier(model) - Brier(market), {label}: {per.mean():+.4f}   95% CI [{lo:+.4f}, {hi:+.4f}]   -> "
+              + ("model better (significant)" if hi < 0 else "market better (significant)" if lo > 0 else "NOT significantly different"))
+    print("  blend w*model + (1-w)*market  (Brier, lower is better):")
+    for wgt in (0.0, 0.25, 0.5, 0.75, 1.0):
+        print(f"    w={wgt:.2f}  {bt.brier(wgt * P + (1 - wgt) * M, Y):.4f}")
+    boot(np.ones(len(P), bool), "whole window   ")
+    boot(T < 1800, "first 30 min   ")
+    boot(T >= 1800, "last 30 min    ")
     print("  who is right when they DISAGREE?  (edge = model - market; realised = outcome - market)")
     d = P - M
     for lo, hi in ((-1, -.10), (-.10, -.05), (-.05, -.02), (-.02, .02), (.02, .05), (.05, .10), (.10, 1)):

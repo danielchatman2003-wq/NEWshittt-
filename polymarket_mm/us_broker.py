@@ -87,7 +87,17 @@ class UsRest:
                 self.limiter.acquire()
             data = json.dumps(body, separators=(",", ":")) if body is not None else None
             headers = {**self.auth.headers(method, path), "Content-Type": "application/json"}  # signs path only
-            r = self.s.request(method, REST + path, params=params, data=data, headers=headers, timeout=5)
+            # Reads and cancels are safe to retry on a network blip; creating an order is NOT (it may have landed).
+            tries = 3 if (method == "GET" or priority) else 1
+            for k in range(tries):
+                try:
+                    r = self.s.request(method, REST + path, params=params, data=data, headers=headers, timeout=5)
+                    break
+                except (requests.ConnectionError, requests.Timeout):
+                    if k == tries - 1:
+                        raise
+                    time.sleep(0.3 * (k + 1))
+                    headers = {**self.auth.headers(method, path), "Content-Type": "application/json"}  # fresh timestamp
             if r.status_code == 429 and attempt == 0:
                 time.sleep(1.0)  # docs: stop, wait >= 1s, retry
                 continue
@@ -169,6 +179,11 @@ class LiveBroker:
             resp = self.rest.call("POST", "/v1/orders", body=order_body(self.slug, intent, price, qty, expire_at=self.expire_at))
         except UsApiError as e:  # a rejected maker-only quote (would cross) must not kill the loop
             log.warning("place %s %.2f x%s rejected: %s", intent[13:], price, qty, e)
+            return None
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # unknown whether it landed: don't assume either way, re-read the exchange's list next time
+            log.warning("place %s %.2f x%s: network error, will re-check open orders (%s)", intent[13:], price, qty, type(e).__name__)
+            self._last = 0.0
             return None
         oid = resp.get("id")
         if oid:

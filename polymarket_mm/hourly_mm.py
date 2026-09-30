@@ -5,6 +5,7 @@
   python -m polymarket_mm.hourly_mm --live          REAL orders
 """
 import argparse
+from collections import deque
 import logging
 import math
 import signal
@@ -29,7 +30,7 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class HourlyConfig:
     size: float = 1.0             # contracts per quote (1 per trade)
-    max_pos: float = 3.0          # max net contracts either way
+    max_pos: float = 1.0          # max net contracts either way: at 1, a held contract only quotes its EXIT (no stacking)
     min_half: float = 0.02        # minimum half-spread (probability units)
     skew: float = 0.03            # fair-value shift at max inventory
     react_seconds: float = 5.0    # widen by the fair-value move possible in this long
@@ -41,7 +42,12 @@ class HourlyConfig:
     warmup_samples: int = 180     # seconds of BRTI history needed before trusting the vol estimate
     spike_sigmas: float = 3.0     # 10s BRTI move (in sigmas) that halts quoting
     halt_seconds: float = 10.0
+    fill_widen: float = 0.01      # widen both sides this much after any fill (fills are where informed flow shows up)
+    fill_widen_seconds: float = 30.0
+    trend_window: float = 3.0     # also widen by how far fair value moved over this many seconds
+    trend_cap: float = 0.05
     loop_hz: float = 4.0
+    max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,17 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     return out
 
 
+def extra_half(*, now: float, last_fill: float, fair_hist, fair: float, cfg: HourlyConfig) -> float:
+    """Adverse-selection padding on top of the base half-spread: (a) +fill_widen for fill_widen_seconds after any
+    fill, (b) the amount fair value moved over the last trend_window seconds (capped). Fast markets and fresh
+    fills are exactly when informed traders are hitting us, so we stand further away."""
+    pad = cfg.fill_widen if now - last_fill < cfg.fill_widen_seconds else 0.0
+    old = next((f for t, f in fair_hist if t >= now - cfg.trend_window), None)
+    if old is not None:
+        pad += min(cfg.trend_cap, abs(fair - old))
+    return pad
+
+
 def describe(q: DesiredQuote) -> str:
     """Plain-English quote: prices are shown in the price OF THE SIDE being traded (Up or Down)."""
     return {BUY_LONG: f"BID UP {q.price:.2f}", SELL_LONG: f"SELL UP {q.price:.2f}",
@@ -93,6 +110,10 @@ class HourlyMaker:
         self._halt_until = 0.0
         self.stop = threading.Event()
         self.total_pnl = 0.0
+        self._fair_hist: deque = deque(maxlen=64)   # (time, fair) for the trend pad
+        self._last_fill = 0.0
+        self._prev_pos: float | None = None
+        self._last_log = 0.0
         brti.on_tick = self._on_tick
 
     # -- model inputs -------------------------------------------------------
@@ -217,71 +238,126 @@ class HourlyMaker:
         for q in todo:
             self.broker.place(q.intent, q.price, q.qty)
 
+    def _step(self) -> None:
+        """One quoting iteration. May raise on network errors; run() handles that."""
+        now = time.time()
+        if self.mkt is None or now >= self.mkt.window_end + 3:
+            if self.mkt:
+                with self._lock:
+                    self.broker.cancel_all()
+                self._settle_paper(now)
+            if not self._roll(now):
+                time.sleep(5)
+                return
+        m = self.mkt
+        if m.price_to_beat is None and now >= m.window_start + 10:
+            fresh = find_current(self.us, now)
+            if fresh and fresh.slug == m.slug and fresh.price_to_beat:
+                self.mkt = m = fresh
+        fault = getattr(self.broker, "fault", None)
+        if fault:
+            log.critical("BROKER FAULT: %s", fault)
+            self.stop.set()
+            return
+        why = self._quoteable(now)
+        with self._lock:
+            if why:
+                if self._quoted_fair is not None or self.broker.open_orders():
+                    self.broker.cancel_all()
+                    self._quoted_fair = None
+                if now - self._last_log > 10:
+                    log.info("not quoting: %s (T-%.0fs)", why, m.window_end - now)
+                    self._last_log = now
+                return
+            spot = self.sampler.last()
+            sigma = self.sampler.sigma(now)
+            fair = self._fair(now, spot, sigma)
+            if not (self.cfg.min_p <= fair <= self.cfg.max_p):
+                self.broker.cancel_all()
+                self._quoted_fair = None
+                return
+            pos = self.broker.position()
+            if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
+                self._last_fill = now  # position changed => we were just traded against
+            self._prev_pos = pos
+            half = self._half(now, spot, sigma, fair) + extra_half(
+                now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
+            self._fair_hist.append((now, fair))
+            want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty)
+            self._reconcile(want, m.tick, fair, half)
+            self._quoted_fair, self._quoted_half = fair, half
+            if now - self._last_log > 5:
+                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | pos %+g (+=Up -=Down) | %s",
+                         m.window_end - now, spot, self._k(), fair, 1 - fair, pos,
+                         "  &  ".join(describe(q) for q in want))
+                self._last_log = now
+
     def run(self) -> None:
-        last_log = 0.0
+        """Quote until stopped. A network blip must never kill the bot: errors are logged and retried; if they
+        persist we try hard to cancel everything and exit (orders also carry an exchange-side expiry)."""
+        errors = 0
         try:
             while not self.stop.is_set():
-                now = time.time()
-                if self.mkt is None or now >= self.mkt.window_end + 3:
-                    if self.mkt:
-                        with self._lock:
-                            self.broker.cancel_all()
-                        self._settle_paper(now)
-                    if not self._roll(now):
-                        time.sleep(5)
-                        continue
-                m = self.mkt
-                if m.price_to_beat is None and now >= m.window_start + 10:
-                    fresh = find_current(self.us, now)
-                    if fresh and fresh.slug == m.slug and fresh.price_to_beat:
-                        self.mkt = m = fresh
-                fault = getattr(self.broker, "fault", None)
-                if fault:
-                    log.critical("BROKER FAULT: %s", fault)
-                    self.stop.set()
-                    break
-                why = self._quoteable(now)
-                with self._lock:
-                    if why:
-                        if self._quoted_fair is not None or self.broker.open_orders():
-                            self.broker.cancel_all()
-                            self._quoted_fair = None
-                        if now - last_log > 10:
-                            log.info("not quoting: %s (T-%.0fs)", why, m.window_end - now)
-                            last_log = now
-                    else:
-                        spot = self.sampler.last()
-                        sigma = self.sampler.sigma(now)
-                        fair = self._fair(now, spot, sigma)
-                        if self.cfg.min_p <= fair <= self.cfg.max_p:
-                            half = self._half(now, spot, sigma, fair)
-                            want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=self.broker.position(), cfg=self.cfg,
-                                              min_qty=m.min_qty)
-                            self._reconcile(want, m.tick, fair, half)
-                            self._quoted_fair, self._quoted_half = fair, half
-                            if now - last_log > 5:
-                                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | pos %+g (+=Up -=Down) | %s",
-                                         m.window_end - now, spot, self._k(), fair, 1 - fair, self.broker.position(),
-                                         "  &  ".join(describe(q) for q in want))
-                                last_log = now
-                        else:
-                            self.broker.cancel_all()
-                            self._quoted_fair = None
+                try:
+                    self._step()
+                    errors = 0
+                except Exception as e:
+                    errors += 1
+                    log.warning("loop error %d/%d: %s: %s", errors, self.cfg.max_errors, type(e).__name__, str(e)[:120])
+                    if errors == 3:  # stop leaving quotes unattended while the API is unreachable
+                        self._safe_cancel_all("3 consecutive errors")
+                    if errors >= self.cfg.max_errors:
+                        log.critical("%d consecutive errors, giving up", errors)
+                        break
+                    time.sleep(min(2.0, 0.25 * errors))
+                    continue
                 time.sleep(1 / self.cfg.loop_hz)
         finally:
             self.shutdown()
 
-    def shutdown(self) -> None:
-        log.info("shutting down: cancelling all quotes")
-        try:
-            if self.broker:
+    def _safe_cancel_all(self, why: str, attempts: int = 5) -> bool:
+        if not self.broker:
+            return True
+        for i in range(attempts):
+            try:
                 with self._lock:
                     self.broker.cancel_all()
-        except Exception:
-            log.exception("CANCEL FAILED on shutdown - CHECK OPEN ORDERS MANUALLY")
+                self._quoted_fair = None
+                return True
+            except Exception as e:
+                log.warning("cancel_all failed (%s) attempt %d/%d: %s", why, i + 1, attempts, str(e)[:100])
+                time.sleep(1.0)
+        return False
+
+    def shutdown(self) -> None:
+        log.info("shutting down: cancelling all quotes")
+        if not self._safe_cancel_all("shutdown", attempts=8):
+            log.critical("COULD NOT CANCEL ON SHUTDOWN - CHECK OPEN ORDERS MANUALLY (they expire at the quoting deadline)")
         if self.book_feed:
             self.book_feed.stop()
         self.brti.stop()
+
+
+def seed_sampler(sampler: SecondSampler, kalshi: KalshiAuth, minutes: int = 20) -> int:
+    """Pre-load the last ~`minutes` of real BRTI (one print per second) from Kalshi's CF history passthrough."""
+    import requests
+    from datetime import datetime, timedelta, timezone
+    path, now = "/trade-api/v2/cfbenchmarks/history/values", time.time()
+    base = datetime.fromtimestamp(now, timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hours = [base - timedelta(hours=1), base] if (now - base.timestamp()) < minutes * 60 else [base]
+    n = 0
+    for h in hours:
+        r = requests.get("https://external-api.kalshi.com" + path,
+                         params={"id": "BRTI", "timespan": "HOUR", "timestamp": h.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                         headers=kalshi.headers("GET", path), timeout=30)
+        if not r.ok:
+            log.warning("could not seed BRTI history (%s); will warm up live instead", r.status_code)
+            continue
+        for t in r.json()["data"]["payload"]:
+            if t["time"] % 1000 == 0 and t["time"] / 1000 <= now and t["time"] / 1000 >= now - minutes * 60:
+                sampler.add(t["time"] / 1000, float(t["value"]))
+                n += 1
+    return n
 
 
 def preview_check(us: UsAuth) -> None:
@@ -316,7 +392,9 @@ def main() -> None:
         return preview_check(us)
 
     sampler = SecondSampler()
-    brti = BrtiFeed(KalshiAuth.from_env())
+    kalshi = KalshiAuth.from_env()
+    log.info("seeded %d seconds of recent BRTI history (no warm-up wait)", seed_sampler(sampler, kalshi))
+    brti = BrtiFeed(kalshi)
     rest = UsRest(us) if args.live else None
     if args.live:
         log.warning("LIVE MODE: placing real orders")

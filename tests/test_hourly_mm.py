@@ -278,3 +278,99 @@ def test_vanished_order_counts_as_filled_until_position_confirms():
     assert b.position() == 1.0                                 # assume the fill: cap can't be overshot
     b._pending = (1.0, time.monotonic() - 10)                  # 10s later with no confirmation: stop assuming
     assert b.position() == 0.0
+
+
+# ---- stop the "yes loop": cap of 1, exit-only when holding, adverse-selection padding ----------------
+def test_holding_one_contract_quotes_only_the_exit_no_stacking():
+    cfg = HourlyConfig()
+    assert cfg.max_pos == 1.0
+    up = {x.intent: x for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=1.0, cfg=cfg)}
+    assert set(up) == {SELL_LONG}                                   # no more Up bids while long Up
+    dn = {x.intent: x for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=-1.0, cfg=cfg)}
+    assert set(dn) == {SELL_SHORT}                                  # no more Down bids while long Down
+    flat = {x.intent: x for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=0.0, cfg=cfg)}
+    assert set(flat) == {BUY_LONG, BUY_SHORT}                       # flat -> two-sided entry
+
+
+def test_exit_is_priced_to_actually_fill_when_holding():
+    cfg = HourlyConfig()
+    flat_ask = {x.intent: x for x in yes_quotes(fair=0.5, half=0.02, tick=0.01, pos=0.0, cfg=cfg)}[BUY_SHORT].price
+    held_ask = {x.intent: x for x in yes_quotes(fair=0.5, half=0.02, tick=0.01, pos=1.0, cfg=cfg)}[SELL_LONG].price
+    assert held_ask < flat_ask and held_ask <= 0.50                 # leans the exit toward/below fair to get out
+
+
+def test_extra_half_after_fill_and_in_fast_markets():
+    from polymarket_mm.hourly_mm import extra_half
+    cfg = HourlyConfig()
+    calm = [(100 + i, 0.50) for i in range(4)]
+    assert extra_half(now=104, last_fill=0, fair_hist=calm, fair=0.50, cfg=cfg) == 0.0
+    assert abs(extra_half(now=104, last_fill=90, fair_hist=calm, fair=0.50, cfg=cfg) - cfg.fill_widen) < 1e-12
+    fast = [(101, 0.50), (102, 0.48), (103, 0.46)]
+    assert abs(extra_half(now=104, last_fill=0, fair_hist=fast, fair=0.44, cfg=cfg) - 0.06) < 1e-9 or \
+        abs(extra_half(now=104, last_fill=0, fair_hist=fast, fair=0.44, cfg=cfg) - cfg.trend_cap) < 1e-9
+    assert extra_half(now=104, last_fill=0, fair_hist=fast, fair=0.0, cfg=cfg) == cfg.trend_cap   # capped
+
+
+# ---- a network blip must not kill the bot (seen live: ProxyError ended the run and the cancel also failed) ----
+def test_run_survives_transient_errors_and_keeps_going():
+    from polymarket_mm.hourly_mm import HourlyMaker
+    m = object.__new__(HourlyMaker)
+    m.cfg, m.stop, m.broker = HourlyConfig(loop_hz=200.0), __import__("threading").Event(), None
+    m._lock = __import__("threading").Lock()
+    calls = {"n": 0}
+
+    def step():
+        calls["n"] += 1
+        if calls["n"] in (1, 2):
+            raise ConnectionError("proxy blip")
+        if calls["n"] >= 5:
+            m.stop.set()
+
+    m._step, m.shutdown, m._safe_cancel_all = step, lambda: None, lambda *a, **k: True
+    m.run()
+    assert calls["n"] >= 5                      # kept going after two errors
+
+
+def test_run_gives_up_after_persistent_errors_and_still_shuts_down(monkeypatch):
+    from polymarket_mm.hourly_mm import HourlyMaker
+    m = object.__new__(HourlyMaker)
+    m.cfg, m.stop, m.broker = HourlyConfig(max_errors=3), __import__("threading").Event(), None
+    shut = []
+    m._step = lambda: (_ for _ in ()).throw(ConnectionError("down"))
+    m.shutdown, m._safe_cancel_all = lambda: shut.append(1), lambda *a, **k: True
+    monkeypatch.setattr("polymarket_mm.hourly_mm.time.sleep", lambda s: None)   # don't actually wait (auto-restored)
+    m.run()
+    assert shut == [1]
+
+
+def test_rest_retries_reads_but_never_retries_order_creation():
+    import requests
+    from polymarket_mm.us_broker import UsRest
+
+    class Flaky:
+        def __init__(self, fail):
+            self.fail, self.calls = fail, 0
+
+        def request(self, *a, **k):
+            self.calls += 1
+            if self.calls <= self.fail:
+                raise requests.ConnectionError("blip")
+
+            class R:
+                status_code, ok, content = 200, True, b"{}"
+                def json(self): return {}
+            return R()
+
+    class A:
+        def headers(self, *a): return {}
+
+    s = Flaky(2)
+    UsRest(A(), rps=1000, session=s).call("GET", "/v1/orders/open")          # survives 2 blips
+    assert s.calls == 3
+    s2 = Flaky(1)
+    try:
+        UsRest(A(), rps=1000, session=s2).call("POST", "/v1/orders", body={})
+        assert False, "order creation must not be retried"
+    except requests.ConnectionError:
+        pass
+    assert s2.calls == 1

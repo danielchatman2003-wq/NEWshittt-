@@ -22,6 +22,7 @@ from .model import SecondSampler, fair_up
 from .quoter import _ceil, _d, _floor
 from .us_broker import (BUY_LONG, BUY_SHORT, SELL_LONG, SELL_SHORT, LiveBroker, PaperBroker, UsRest,
                         order_body)
+from .toxicity import MarkoutTracker, ToxicityGate, TradeFlow, parse_trade, pressure
 from .us_feed import UsAuth, UsBookFeed
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,16 @@ class HourlyConfig:
     loss_mark: float = 0.01       # 'moved against us' = fair moved this much against the entry
     lean: float | None = None     # None: quotes centre on the MODEL's fair value. 0..1: centre on the BOOK's mid and tilt this fraction
                                   # of the way toward the model (spread-collector: join the touch on both sides, lean second)
+    # --- adverse-selection defences (book / flow / markout) ---
+    tox_on: bool = True            # block entries on the side the order book & trade flow are pressing against
+    tox_trip: float = 0.45         # pressure (-1..1) that trips the gate ...
+    tox_rearm: float = 0.25        # ... and the level it must fall back inside to clear (hysteresis)
+    tox_cooldown: float = 3.0      # seconds of extra quiet after it clears
+    flow_window: float = 10.0      # trade-flow lookback (seconds)
+    markout_horizon: float = 10.0  # judge each fill by the mid this long after it
+    markout_widen: float = 0.015   # EWMA markout worse than -1.5c => widen quotes by 1c
+    markout_pause: float = 0.03    # worse than -3c (over >=4 fills) => stop entering for markout_pause_secs
+    markout_pause_secs: float = 60.0
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -220,6 +231,13 @@ class HourlyMaker:
         self._prev_pos: float | None = None
         self._last_log = 0.0
         self.budget = DirectionBudget(cfg)
+        self.gate = ToxicityGate(cfg.tox_trip, cfg.tox_rearm, cfg.tox_cooldown)
+        self.flow = TradeFlow(cfg.flow_window)
+        self.markout = MarkoutTracker(cfg.markout_horizon)
+        self._pressure = 0.0
+        self._pause_until = 0.0
+        self._last_want: list = []
+        self._pulls = 0
         self._inv_since: float | None = None   # when the current inventory was first seen
         self._last_take = 0.0
         brti.on_tick = self._on_tick
@@ -285,9 +303,30 @@ class HourlyMaker:
         except Exception:
             log.exception("tick handler failed")
 
+    def _on_trade(self, raw) -> None:
+        tr = parse_trade(raw)
+        if tr:
+            self.flow.add(time.time(), tr[1], tr[2])
+
     def _on_book(self, book) -> None:
         if isinstance(self.broker, PaperBroker):
             self.broker.on_book(book.best_bid, book.best_ask)
+        if not self.cfg.tox_on or self.broker is None or book.best_bid is None or book.best_ask is None:
+            return
+        now = time.time()
+        self._pressure = pressure(book, self.flow.imbalance(now))
+        _, _, new_down, new_up = self.gate.update(now, self._pressure)
+        if new_down or new_up:                # flow just turned against one side: pull that entry within one book update
+            doomed = BUY_LONG if new_down else BUY_SHORT          # down pressure endangers Up bids; up pressure, Down bids
+            try:
+                with self._lock:
+                    for o in self.broker.open_orders():
+                        if o.intent == doomed:
+                            self.broker.cancel(o.id)
+                            self._pulls += 1
+                            log.info("TOXICITY PULL: pressure %+.2f -> cancelled %s %.2f", self._pressure, o.intent[13:], o.price)
+            except Exception:
+                log.exception("toxicity pull failed")
 
     # -- lifecycle ----------------------------------------------------------
     def _roll(self, now: float) -> bool:
@@ -299,6 +338,7 @@ class HourlyMaker:
         self.mkt = nxt
         self.book_feed = UsBookFeed(self.us, [nxt.slug])
         self.book_feed.on_update = self._on_book
+        self.book_feed.on_trade = self._on_trade if self.cfg.tox_on else None
         self.book_feed.start()
         if self.rest:
             self.broker = LiveBroker(self.rest, nxt.slug, expire_at=nxt.window_end - self.cfg.stop_before_end)
@@ -406,7 +446,20 @@ class HourlyMaker:
             pos = self.broker.position()
             if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
                 self._last_fill = now  # position changed => we were just traded against
+                mid_now = bk.mid if bk else None
+                d = 1 if pos > self._prev_pos else -1                 # +1 we bought YES exposure (Up), -1 we sold it (Down)
+                px = next((q.price for q in self._last_want if (q.intent in (BUY_LONG, SELL_SHORT)) == (d > 0)), mid_now)
+                if px is not None:
+                    self.markout.add(now, d, px)
             self._prev_pos = pos
+            for mo in self.markout.update(now, bk.mid if bk else None):
+                log.info("markout %+.1fc (EWMA %+.1fc over %d fills)", mo * 100, (self.markout.ewma or 0) * 100, self.markout.n)
+            if (self.markout.ewma is not None and self.markout.n >= 4 and self.markout.ewma <= -self.cfg.markout_pause
+                    and now >= self._pause_until):
+                self._pause_until = now + self.cfg.markout_pause_secs
+                self.markout.ewma = None
+                log.warning("MARKOUT PAUSE: fills are being picked off (EWMA <= -%.1fc) -> no new entries for %.0fs",
+                            self.cfg.markout_pause * 100, self.cfg.markout_pause_secs)
             self.budget.update(pos=pos, fair=fair, now=now, min_qty=m.min_qty)
             if abs(pos) > m.min_qty:
                 self._inv_since = self._inv_since or now
@@ -427,18 +480,28 @@ class HourlyMaker:
                     return
                 log.info("exit take skipped: bid too far below fair (model says hold)")
             pad = extra_half(now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
+            if self.markout.ewma is not None and self.markout.ewma <= -self.cfg.markout_widen:
+                pad += 0.01                                      # getting picked off: stand further away
             half = self._half(now, spot, sigma, fair) + pad
             self._fair_hist.append((now, fair))
+            tox_up = tox_down = False
+            if self.cfg.tox_on and bk:
+                self._pressure = pressure(bk, self.flow.imbalance(now))
+                tox_up, tox_down, _, _ = self.gate.update(now, self._pressure)    # block Up bids on down pressure, Down bids on up
+            paused = now < self._pause_until
             want = yes_quotes(fair=fair_q, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
                               book=(bk.best_bid, bk.best_ask) if bk else None,
                               touch_tol=max(0.0, self.cfg.touch_tol - pad),
-                              block_up=self.budget.blocked("up", now), block_down=self.budget.blocked("down", now))
+                              block_up=self.budget.blocked("up", now) or tox_up or paused,
+                              block_down=self.budget.blocked("down", now) or tox_down or paused)
+            self._last_want = want
             self._reconcile(want, m.tick, fair_q, half)
             self._quoted_fair, self._quoted_half = fair, half
             if now - self._last_log > 5:
-                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | %s | pos %+g (+=Up -=Down) | %s",
-                         m.window_end - now, spot, self._k(), fair, 1 - fair, book_view(bk), pos,
-                         "  &  ".join(describe(q) for q in want))
+                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | %s | pressure %+.2f%s | entries Up %d / Down %d | pos %+g | %s",
+                         m.window_end - now, spot, self._k(), fair, 1 - fair, book_view(bk), self._pressure,
+                         " [BLOCK UP BIDS]" if tox_up else " [BLOCK DOWN BIDS]" if tox_down else " [PAUSED]" if paused else "",
+                         self.budget.entries["up"], self.budget.entries["down"], pos, "  &  ".join(describe(q) for q in want))
                 self._last_log = now
 
     def run(self) -> None:

@@ -133,6 +133,7 @@ class UsBookFeed:
         self._stop = threading.Event()
         self._connected = False
         self.on_update = None  # callback(UsBook) on the feed thread, per update
+        self.on_trade = None   # optional callback(raw_frame) for trade frames; if set we also subscribe to the trade stream
         self.stats = {"frames": 0, "updates": 0, "reconnects": 0}
 
     def book(self, slug: str) -> UsBook | None:
@@ -167,6 +168,13 @@ class UsBookFeed:
                 "marketSlugs": self.slugs,
                 "responsesDebounced": False,
             }}))
+            if self.on_trade:
+                await ws.send(json.dumps({"subscribe": {
+                    "requestId": f"tr-{int(time.time())}",
+                    "subscriptionType": "SUBSCRIPTION_TYPE_TRADE",
+                    "marketSlugs": self.slugs,
+                    "responsesDebounced": False,
+                }}))
             log.info("US feed connected, subscribed to %d markets", len(self.slugs))
             self._connected = True
             try:
@@ -181,6 +189,12 @@ class UsBookFeed:
             if self._stop.is_set():
                 return
             self.stats["frames"] += 1
+            if self.on_trade and b'"trade"' in (raw if isinstance(raw, bytes) else raw.encode()):
+                try:
+                    self.on_trade(raw)
+                except Exception:
+                    log.exception("on_trade failed")
+                continue
             book = parse_frame(raw)
             if book is None:
                 log.debug("non-book frame: %.300s", raw)

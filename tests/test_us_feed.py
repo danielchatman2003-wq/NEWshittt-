@@ -103,3 +103,47 @@ def test_session_end_to_end_against_local_server():
     assert sub["responsesDebounced"] is False
     assert feed.book("m1") is None or feed.book("m1").best_bid == 0.555  # cleared while between sessions
     assert feed.stats["reconnects"] == 0 or feed.stats["updates"] >= 2
+
+
+def test_trade_stream_is_subscribed_and_delivered_to_the_callback():
+    import asyncio
+    import threading
+
+    import websockets
+
+    TRADE = json.dumps({"requestId": "t", "subscriptionType": "SUBSCRIPTION_TYPE_TRADE", "trade": {
+        "marketSlug": "m1", "price": {"value": "0.30"}, "quantity": {"value": "5.0"}, "tradeTime": "2026-09-30T19:49:59Z",
+        "maker": {"side": "ORDER_SIDE_SELL"}}})
+    subs = []
+
+    async def handler(ws):
+        for _ in range(2):                                   # book subscribe, then trade subscribe
+            subs.append(json.loads(await ws.recv())["subscribe"]["subscriptionType"])
+        await ws.send(json.dumps(FRAME))
+        await ws.send(TRADE)
+        await asyncio.sleep(2)
+
+    ready, port = threading.Event(), {}
+
+    def serve():
+        async def main():
+            async with websockets.serve(handler, "127.0.0.1", 0) as s:
+                port["p"] = s.sockets[0].getsockname()[1]
+                ready.set()
+                await asyncio.sleep(4)
+        asyncio.run(main())
+
+    threading.Thread(target=serve, daemon=True).start()
+    ready.wait(5)
+    k = ed25519.Ed25519PrivateKey.generate()
+    feed = UsBookFeed(UsAuth("kid", base64.b64encode(k.private_bytes_raw()).decode()), ["m1"], url=f"ws://127.0.0.1:{port['p']}")
+    books, trades = [], []
+    feed.on_update, feed.on_trade = books.append, trades.append
+    feed.start()
+    deadline = time.time() + 4
+    while (not books or not trades) and time.time() < deadline:
+        time.sleep(0.05)
+    feed.stop()
+    assert subs == ["SUBSCRIPTION_TYPE_MARKET_DATA", "SUBSCRIPTION_TYPE_TRADE"]
+    assert books and books[0].best_bid == 0.555               # book frames still flow
+    assert trades and b'"trade"' in trades[0].encode()        # and the trade frame reached the callback, not the book parser

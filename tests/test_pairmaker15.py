@@ -150,3 +150,24 @@ def test_kill_switch_trips_on_session_loss_paper():
     m.total_pnl = -1.2
     assert m._check_loss(0.0) and m.killed
     assert all(not b.open_orders() for b in m.brokers.values())
+
+
+def test_live_mode_book_callback_never_touches_brokers():
+    """Regression: the paper fill-simulation hook crashed on live brokers (no on_book) on every book update."""
+    import threading
+    m = object.__new__(PairMaker)
+    m.live, m._lock, m.brokers = True, threading.Lock(), {K: object(), P: object()}     # live brokers have no on_book
+    m._on_book(K)(book(0.3, 0.31))                                                        # must not raise
+    m.live, m.brokers = False, {K: PaperBroker()}
+    m._on_book(K)(book(0.3, 0.31))                                                        # paper path still works
+    m.brokers = {}                                                                        # before brokers exist: no crash
+    m._on_book(P)(book(0.3, 0.31))
+
+
+def test_one_attempt_per_window_after_a_lone_leg_exit():
+    """Seen live: after a lone-leg exit the bot immediately started another pair into the same move."""
+    m = make_maker()
+    m.window_done = False
+    m.brokers[K].pos = 1.0
+    m._exit_lone_leg({K: 1.0, P: 0.0}, 0.30, book(0.29, 0.30), book(0.29, 0.30))
+    assert m.window_done is True

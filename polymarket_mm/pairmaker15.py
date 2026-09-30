@@ -142,6 +142,7 @@ class PairMaker:
         self._last_cash = 0.0
         self._equity0: float | None = None
         self.first_fill: float | None = None
+        self.window_done = False   # one attempt per window: after a lone-leg exit we stand down until the next window
         self.total_pnl, self.windows, self.stats = 0.0, 0, {"pairs": 0, "legged": 0, "no_fill": 0}
         self._last_log = 0.0
 
@@ -173,8 +174,12 @@ class PairMaker:
 
     def _on_book(self, venue: str):
         def cb(book):
+            if self.live:
+                return                      # real fills come from the exchanges; book-driven fill simulation is paper-only
             with self._lock:
-                self.brokers[venue].on_book(book.best_bid, book.best_ask)
+                b = self.brokers.get(venue)
+                if b is not None:
+                    b.on_book(book.best_bid, book.best_ask)
         return cb
 
     def _roll(self, now: float) -> bool:
@@ -192,6 +197,7 @@ class PairMaker:
         if self.live:
             self.brokers, self._k_ticker = {}, None      # fresh live brokers per window (per-market tickers/slugs)
         self.first_fill = None
+        self.window_done = False
         log.info("=== window %s (ref %s) ===", nxt.slug[-16:], nxt.price_to_beat)
         return True
 
@@ -261,7 +267,7 @@ class PairMaker:
                     self._exit_lone_leg(net, fair, kb, pb)
                 return
             self.first_fill = None
-            if self.killed or self._check_loss(now):
+            if self.window_done or self.killed or self._check_loss(now):
                 self._sync_orders(None)
                 return
             # 2) flat: rest a pair if the window/price is suitable (one pair per window)
@@ -317,6 +323,7 @@ class PairMaker:
 
     def _exit_lone_leg(self, net, fair, kb, pb) -> None:
         """Cancel the waiting partner order and exit the filled leg by crossing the spread (IOC) if not absurdly bad."""
+        self.window_done = True        # one legging attempt per window: don't immediately try again into the same move
         for b in self.brokers.values():
             b.cancel_all()
         for v, book in ((K, kb), (P, pb)):

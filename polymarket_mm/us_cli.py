@@ -10,17 +10,6 @@ from dotenv import load_dotenv
 from .us_feed import REST, UsAuth, UsBookFeed
 
 
-def _slugs(obj, out):
-    if isinstance(obj, dict):
-        if isinstance(obj.get("slug"), str):
-            out.append(obj["slug"])
-        for v in obj.values():
-            _slugs(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            _slugs(v, out)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", action="append", default=[])
@@ -33,11 +22,13 @@ def main() -> None:
     auth = UsAuth.from_env()
 
     if args.discover:
-        r = requests.get(f"{REST}/v1/markets", params={"limit": 20}, headers=auth.headers("GET", "/v1/markets"), timeout=15)
+        r = requests.get(f"{REST}/v1/markets", params={"active": "true", "closed": "false", "limit": 30}, headers=auth.headers("GET", "/v1/markets"), timeout=15)
         print("HTTP", r.status_code)
-        found: list[str] = []
-        _slugs(r.json() if r.ok else {}, found)
-        print("\n".join(dict.fromkeys(found)) or r.text[:500])
+        if not r.ok:
+            print(r.text[:500])
+            return
+        for m in r.json().get("markets", []):
+            print(f"{m['slug']:<48} {m.get('question', '')[:60]}")
         return
     if not args.slug:
         ap.error("pass --slug (or --discover)")
@@ -45,9 +36,9 @@ def main() -> None:
     feed = UsBookFeed(auth, args.slug)
 
     def show(b):
-        lag = f"{(b.local_ts - b.exchange_ts) * 1000:.0f}ms" if b.exchange_ts else "n/a"
+        age = f"{(b.local_ts - b.exchange_ts) * 1000:.0f}ms" if b.exchange_ts else "n/a"
         print(f"{b.slug}  bid={b.best_bid} ask={b.best_ask} mid={b.mid} spread={b.spread}  "
-              f"depth={len(b.bids)}x{len(b.asks)}  state={b.state}  lag={lag}", flush=True)
+              f"depth={len(b.bids)}x{len(b.asks)}  state={b.state}  last_change_age={age}", flush=True)
 
     feed.on_update = show
     feed.start()

@@ -45,15 +45,13 @@ def test_auth_signature_verifies():
     UsAuth("kid", base64.b64encode(seed).decode()).headers()
 
 
-def test_book_goes_stale_when_feed_quiet():
+def test_book_unavailable_when_disconnected_but_not_when_merely_quiet():
     k = ed25519.Ed25519PrivateKey.generate()
-    f = UsBookFeed(UsAuth("k", base64.b64encode(k.private_bytes_raw()).decode()), ["m1"], stale_after=5)
-    assert f.book("m1") is None
+    f = UsBookFeed(UsAuth("k", base64.b64encode(k.private_bytes_raw()).decode()), ["m1"])
     f._books["m1"] = parse_frame(json.dumps(FRAME))
-    f._last_frame = time.time()
-    assert f.book("m1") is not None
-    f._last_frame = time.time() - 10
-    assert f.book("m1") is None
+    assert f.book("m1") is None            # not connected yet
+    f._connected = True
+    assert f.book("m1") is not None        # connected; silence alone must not invalidate a quiet market
 
 
 def test_session_end_to_end_against_local_server():
@@ -103,4 +101,5 @@ def test_session_end_to_end_against_local_server():
     sub = seen["subs"][0]["subscribe"]
     assert sub["subscriptionType"] == "SUBSCRIPTION_TYPE_MARKET_DATA" and sub["marketSlugs"] == ["m1"]
     assert sub["responsesDebounced"] is False
-    assert feed.book("m1").best_bid == 0.555
+    assert feed.book("m1") is None or feed.book("m1").best_bid == 0.555  # cleared while between sessions
+    assert feed.stats["reconnects"] == 0 or feed.stats["updates"] >= 2

@@ -120,23 +120,25 @@ def parse_frame(raw: str | bytes) -> UsBook | None:
 
 
 class UsBookFeed:
-    """Background client. `book(slug)` from any thread, or set `on_update(book)` for push."""
+    """Background client. `book(slug)` from any thread, or set `on_update(book)` for push.
 
-    def __init__(self, auth: UsAuth, slugs: list[str], url: str = WS_URL, stale_after: float = 10.0):
-        self.auth, self.slugs, self.url, self.stale_after = auth, list(slugs), url, stale_after
+    Health = the socket being alive (protocol pings), NOT frame silence: a quiet market
+    legitimately sends nothing for minutes, and a book only changes when the market does.
+    """
+
+    def __init__(self, auth: UsAuth, slugs: list[str], url: str = WS_URL, ping_every: float = 5.0):
+        self.auth, self.slugs, self.url, self.ping_every = auth, list(slugs), url, ping_every
         self._books: dict[str, UsBook] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._last_frame = 0.0
+        self._connected = False
         self.on_update = None  # callback(UsBook) on the feed thread, per update
         self.stats = {"frames": 0, "updates": 0, "reconnects": 0}
 
     def book(self, slug: str) -> UsBook | None:
-        """Latest book, or None if we've never had one or the feed has gone quiet."""
+        """Latest book, or None if we've never had one or the connection is down (book may be stale)."""
         with self._lock:
-            b = self._books.get(slug)
-        if b is None or time.time() - self._last_frame > self.stale_after:
-            return None
+            b = self._books.get(slug) if self._connected else None
         return b
 
     def start(self) -> None:
@@ -158,7 +160,7 @@ class UsBookFeed:
             backoff = min(backoff * 2, 30)
 
     async def _session(self) -> None:
-        async with websockets.connect(self.url, additional_headers=self.auth.headers(), ping_interval=10) as ws:
+        async with websockets.connect(self.url, additional_headers=self.auth.headers(), ping_interval=self.ping_every, ping_timeout=self.ping_every) as ws:
             await ws.send(json.dumps({"subscribe": {
                 "requestId": f"mm-{int(time.time())}",
                 "subscriptionType": SUB_MARKET_DATA,
@@ -166,22 +168,28 @@ class UsBookFeed:
                 "responsesDebounced": False,
             }}))
             log.info("US feed connected, subscribed to %d markets", len(self.slugs))
-            while not self._stop.is_set():
+            self._connected = True
+            try:
+                await self._read(ws)
+            finally:
+                with self._lock:  # never serve a pre-disconnect book as current after a reconnect
+                    self._connected = False
+                    self._books.clear()
+
+    async def _read(self, ws) -> None:
+        async for raw in ws:
+            if self._stop.is_set():
+                return
+            self.stats["frames"] += 1
+            book = parse_frame(raw)
+            if book is None:
+                log.debug("non-book frame: %.300s", raw)
+                continue
+            with self._lock:
+                self._books[book.slug] = book
+            self.stats["updates"] += 1
+            if self.on_update:
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=self.stale_after)
-                except asyncio.TimeoutError:
-                    raise RuntimeError("no frames (not even heartbeats), reconnecting")
-                self._last_frame = time.time()
-                self.stats["frames"] += 1
-                book = parse_frame(raw)
-                if book is None:
-                    log.debug("non-book frame: %.300s", raw)
-                    continue
-                with self._lock:
-                    self._books[book.slug] = book
-                self.stats["updates"] += 1
-                if self.on_update:
-                    try:
-                        self.on_update(book)
-                    except Exception:
-                        log.exception("on_update callback failed")
+                    self.on_update(book)
+                except Exception:
+                    log.exception("on_update callback failed")

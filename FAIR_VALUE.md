@@ -32,3 +32,19 @@ Normal with closed-form mean/variance, including the part-realised case inside t
 ## Not measured
 * Fills/PnL of actual quoting (history has mids, not queue position/trades): needs forward paper-trading.
 * Regime dependence (14 days, one market regime); fees are taken from the published schedule, not observed.
+
+## Market-making findings from live trading (2026-09-30) and the research behind them
+Live result: ~25 fills at 1 contract, roughly -$0.44 on the day; 18 Up buys vs 2 Down buys while BTC fell ~$500.
+| Question | Test | Answer |
+|---|---|---|
+| Is there a trend the model misses? | `research/trend.py`, 1-15 min lookbacks | No: slope ~0.003 (0.3c per sigma), CIs include 0 |
+| Does the book lead BRTI (our fair value stale)? | `research/book_lead.py` | No: the book moves TOWARD our fair value (~13% of the gap per minute) |
+| Is our model biased against us in a fall? | `research/gap_by_trend.py` | No: gap +0.3c in falling markets (CI includes 0); -1.4c in rising (model lags a little) |
+| Are fills worse in a falling market (would a flow filter help)? | `research/flow_filter.py` | No: markout ~-1.3c everywhere, filter changes nothing; simulated Up/Down fills are 50/50 (30.3k/30.2k) |
+| Does momentum help at seconds scale? | `research/momentum.py` | No |
+| Would directional taker bets pay? | `research/directional.py` | Not significantly; suggestive +2-5c only in the second half of a window |
+
+Conclusion: a passive maker is one-sided only while the market trends one way (bids get hit, the other side has no
+sellers). That cannot be quoted away without predicting the trend, which the data says we cannot. What CAN be done is
+limit the damage: `DirectionBudget` blocks re-entry in a direction for 10 min after exiting it at a loss and caps
+entries to 3 per direction per window. It is a loss limiter, not a source of edge.

@@ -545,3 +545,50 @@ def test_take_body_is_ioc_and_allowed_to_take():
     from polymarket_mm.us_broker import take_body
     b = take_body("s", SELL_LONG, 0.28, 1)
     assert b["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL" and b["participateDontInitiate"] is False and "goodTillTime" not in b
+
+
+# ---- stop re-buying the same losing side (loss limiter for one-way trends) ---------------------------------------
+def test_entries_are_blocked_after_a_losing_exit_then_unblocked():
+    from polymarket_mm.hourly_mm import DirectionBudget
+    cfg = HourlyConfig()
+    b = DirectionBudget(cfg)
+    b.update(pos=0.0, fair=0.44, now=0)
+    b.update(pos=1.0, fair=0.44, now=10)          # bought Up when fair Up was 0.44
+    b.update(pos=1.0, fair=0.40, now=30)
+    b.update(pos=0.0, fair=0.39, now=60)          # exited; Up lost value (0.44 -> 0.39)
+    assert b.blocked("up", 61) and not b.blocked("down", 61)
+    assert b.blocked("up", 60 + cfg.reentry_block - 1)
+    assert not b.blocked("up", 60 + cfg.reentry_block + 1)
+
+
+def test_a_winning_round_trip_does_not_block_reentry():
+    from polymarket_mm.hourly_mm import DirectionBudget
+    b = DirectionBudget(HourlyConfig())
+    b.update(pos=0.0, fair=0.40, now=0)
+    b.update(pos=1.0, fair=0.40, now=5)           # bought Up at fair 0.40
+    b.update(pos=0.0, fair=0.46, now=40)          # sold after it rose: a win
+    assert not b.blocked("up", 41)                # keep making the money cycle
+
+
+def test_down_direction_mirrors_and_cap_per_window_applies():
+    from polymarket_mm.hourly_mm import DirectionBudget
+    cfg = HourlyConfig(max_entries_per_dir=2)
+    b = DirectionBudget(cfg)
+    t = 0
+    for _ in range(2):                            # two Down entries that end FLAT at break-even
+        b.update(pos=0.0, fair=0.50, now=t); b.update(pos=-1.0, fair=0.50, now=t + 1); b.update(pos=0.0, fair=0.50, now=t + 2)
+        t += 10
+    assert b.blocked("down", t)                   # hit the per-window cap of 2 entries
+    assert not b.blocked("up", t)
+    b.reset()
+    assert not b.blocked("down", t)               # new window, fresh budget
+
+
+def test_blocked_direction_is_not_quoted_but_exits_and_other_side_still_are():
+    cfg = HourlyConfig()
+    q = {x.intent for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=0.0, cfg=cfg, block_up=True)}
+    assert q == {BUY_SHORT}                       # only the Down entry remains while Up is blocked
+    q = {x.intent for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=1.0, cfg=cfg, block_up=True)}
+    assert q == {SELL_LONG}                       # a held Up can still be exited
+    q = {x.intent for x in yes_quotes(fair=0.4, half=0.02, tick=0.01, pos=0.0, cfg=cfg, block_up=True, block_down=True)}
+    assert q == set()

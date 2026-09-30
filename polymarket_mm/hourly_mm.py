@@ -54,6 +54,9 @@ class HourlyConfig:
     exit_take_after: float = 60.0  # still holding after this long -> cross the spread (IOC) to get out
     take_slack: float = 0.05      # ...but never take an exit more than this below fair value
     take_retry: float = 10.0
+    reentry_block: float = 600.0  # after exiting a direction with the market moved against us, no new entries that way for this long
+    max_entries_per_dir: int = 3  # hard cap on entries in one direction per window (loss limiter for one-way trends)
+    loss_mark: float = 0.01       # 'moved against us' = fair moved this much against the entry
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -68,7 +71,7 @@ class DesiredQuote:
 
 def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: HourlyConfig,
                min_qty: float = 0.01, book: tuple[float | None, float | None] | None = None,
-               touch_tol: float = 0.0) -> list[DesiredQuote]:
+               touch_tol: float = 0.0, block_up: bool = False, block_down: bool = False) -> list[DesiredQuote]:
     """Quotes in YES-price space. Inventory is unwound first, new exposure only opened when flat that side:
        bid side: SELL_SHORT (close NO) if pos<0 else BUY_LONG;   ask side: SELL_LONG if pos>0 else BUY_SHORT."""
     t = _d(tick)
@@ -109,11 +112,11 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     out: list[DesiredQuote] = []
     if pos < -min_qty:
         out.append(DesiredQuote(SELL_SHORT, float(exit_bid), min(cfg.size, -pos)))
-    elif cfg.max_pos - pos >= min_qty:
+    elif cfg.max_pos - pos >= min_qty and not block_up:
         out.append(DesiredQuote(BUY_LONG, float(bid), min(cfg.size, cfg.max_pos - pos)))
     if pos > min_qty:
         out.append(DesiredQuote(SELL_LONG, float(exit_ask), min(cfg.size, pos)))
-    elif cfg.max_pos + pos >= min_qty:
+    elif cfg.max_pos + pos >= min_qty and not block_down:
         out.append(DesiredQuote(BUY_SHORT, float(ask), min(cfg.size, cfg.max_pos + pos)))
     return out
 
@@ -148,6 +151,36 @@ def extra_half(*, now: float, last_fill: float, fair_hist, fair: float, cfg: Hou
     return pad
 
 
+class DirectionBudget:
+    """Loss limiter for one-way trends. Counts entries per direction per window and, after we EXIT a direction while
+    fair value has moved against that entry, blocks new entries that way for `reentry_block` seconds. It makes no
+    prediction: it just stops the bot re-buying the same falling (or rising) side over and over."""
+
+    def __init__(self, cfg: HourlyConfig):
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self) -> None:
+        self.entries = {"up": 0, "down": 0}
+        self.blocked_until = {"up": 0.0, "down": 0.0}
+        self._held: str | None = None
+        self._entry_fair = 0.0
+
+    def update(self, *, pos: float, fair: float, now: float, min_qty: float = 0.01) -> None:
+        held = "up" if pos > min_qty else "down" if pos < -min_qty else None
+        if held and self._held is None:                      # flat -> holding: an entry
+            self.entries[held] += 1
+            self._entry_fair = fair if held == "up" else 1 - fair
+        elif self._held and held is None:                    # holding -> flat: an exit
+            now_val = fair if self._held == "up" else 1 - fair
+            if now_val < self._entry_fair - self.cfg.loss_mark:          # the side we held lost value
+                self.blocked_until[self._held] = now + self.cfg.reentry_block
+        self._held = held
+
+    def blocked(self, direction: str, now: float) -> bool:
+        return now < self.blocked_until[direction] or self.entries[direction] >= self.cfg.max_entries_per_dir
+
+
 def describe(q: DesiredQuote) -> str:
     """Plain-English quote: prices are shown in the price OF THE SIDE being traded (Up or Down)."""
     return {BUY_LONG: f"BID UP {q.price:.2f}", SELL_LONG: f"SELL UP {q.price:.2f}",
@@ -170,6 +203,7 @@ class HourlyMaker:
         self._last_fill = 0.0
         self._prev_pos: float | None = None
         self._last_log = 0.0
+        self.budget = DirectionBudget(cfg)
         self._inv_since: float | None = None   # when the current inventory was first seen
         self._last_take = 0.0
         brti.on_tick = self._on_tick
@@ -257,6 +291,7 @@ class HourlyMaker:
         else:
             self.broker = PaperBroker()
         self._quoted_fair = None
+        self.budget.reset()
         log.info("market %s  (%s mode)", nxt.slug, "LIVE" if self.rest else "paper")
         return True
 
@@ -348,6 +383,7 @@ class HourlyMaker:
             if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
                 self._last_fill = now  # position changed => we were just traded against
             self._prev_pos = pos
+            self.budget.update(pos=pos, fair=fair, now=now, min_qty=m.min_qty)
             if abs(pos) > m.min_qty:
                 self._inv_since = self._inv_since or now
             else:
@@ -371,7 +407,8 @@ class HourlyMaker:
             self._fair_hist.append((now, fair))
             want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
                               book=(bk.best_bid, bk.best_ask) if bk else None,
-                              touch_tol=max(0.0, self.cfg.touch_tol - pad))
+                              touch_tol=max(0.0, self.cfg.touch_tol - pad),
+                              block_up=self.budget.blocked("up", now), block_down=self.budget.blocked("down", now))
             self._reconcile(want, m.tick, fair, half)
             self._quoted_fair, self._quoted_half = fair, half
             if now - self._last_log > 5:

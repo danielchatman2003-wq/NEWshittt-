@@ -48,6 +48,7 @@ class HourlyConfig:
     trend_window: float = 3.0     # also widen by how far fair value moved over this many seconds
     trend_cap: float = 0.05
     exit_slack: float = 0.02      # an exit may sell up to this far below fair (to join the book and actually fill)
+    touch_tol: float = 0.02       # join the book's top on both sides if within this of fair (0 = model-edge quotes only)
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -61,7 +62,8 @@ class DesiredQuote:
 
 
 def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: HourlyConfig,
-               min_qty: float = 0.01, book: tuple[float | None, float | None] | None = None) -> list[DesiredQuote]:
+               min_qty: float = 0.01, book: tuple[float | None, float | None] | None = None,
+               touch_tol: float = 0.0) -> list[DesiredQuote]:
     """Quotes in YES-price space. Inventory is unwound first, new exposure only opened when flat that side:
        bid side: SELL_SHORT (close NO) if pos<0 else BUY_LONG;   ask side: SELL_LONG if pos>0 else BUY_SHORT."""
     t = _d(tick)
@@ -72,6 +74,19 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     ask = _ceil(center + _d(half), t)
     if bid < t or ask > 1 - t or bid >= ask:
         return []
+    # Two-sided flow: ENTRY quotes join the top of the real book on BOTH sides (bid Up at the best bid, bid Down at the
+    # best Down bid = Up ask), as long as that price is within `touch_tol` of fair. Without this, when the book is a bit
+    # more bearish than the model the Up bid lands at the top of the book and fills, while the Down bid sits cents behind
+    # the Down book and never does -- a one-sided machine. The model still caps what we will pay (fair + touch_tol).
+    if book and touch_tol > 0 and book[0] is not None and book[1] is not None:
+        cap_bid = _floor(_d(round(fair, 6)) + _d(touch_tol), t)       # dearest we'll pay for Up (or sell Down)
+        cap_ask = _ceil(_d(round(fair, 6)) - _d(touch_tol), t)        # cheapest we'll sell Up / pay for Down
+        tb = max(bid, min(_floor(_d(book[0]), t), cap_bid))           # join best bid if the model allows
+        ta = min(ask, max(_ceil(_d(book[1]), t), cap_ask))            # join best ask if the model allows
+        tb = min(tb, _d(book[1]) - t)                                  # post-only: never at/through the other side
+        ta = max(ta, _d(book[0]) + t)
+        if tb < ta:
+            bid, ask = tb, ta
     # Exits are priced off the REAL book (best_bid, best_ask of the YES book): join the top of the book on our side so
     # we actually get filled, but never give away more than exit_slack below fair, and never cross (post-only).
     bb, ba = (book or (None, None))
@@ -304,12 +319,13 @@ class HourlyMaker:
             if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
                 self._last_fill = now  # position changed => we were just traded against
             self._prev_pos = pos
-            half = self._half(now, spot, sigma, fair) + extra_half(
-                now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
+            pad = extra_half(now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
+            half = self._half(now, spot, sigma, fair) + pad
             self._fair_hist.append((now, fair))
             bk = self.book_feed.book(m.slug)
             want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
-                              book=(bk.best_bid, bk.best_ask) if bk else None)
+                              book=(bk.best_bid, bk.best_ask) if bk else None,
+                              touch_tol=max(0.0, self.cfg.touch_tol - pad))
             self._reconcile(want, m.tick, fair, half)
             self._quoted_fair, self._quoted_half = fair, half
             if now - self._last_log > 5:

@@ -455,3 +455,45 @@ def test_sticky_exit_does_not_chase_a_slow_drift_but_entries_still_requote():
     m = _maker([RestingOrder("b", BUY_LONG, 0.40, 1.0)])
     m._reconcile([DesiredQuote(BUY_LONG, 0.43, 1.0)], 0.01, fair=0.45, half=0.02)     # entries stay tight (1 tick)
     assert m.broker.cancelled == ["b"]
+
+
+# ---- two-sided flow: join the top of the book on BOTH sides -------------------------------------------------
+def _entries(fair, book, tol=0.02, half=0.02):
+    cfg = HourlyConfig()
+    q = {x.intent: x for x in yes_quotes(fair=fair, half=half, tick=0.01, pos=0.0, cfg=cfg, book=book, touch_tol=tol)}
+    return q[BUY_LONG].price, 1 - q[BUY_SHORT].price          # (Up bid, Down bid)
+
+
+def test_live_snapshot_now_bids_down_at_the_top_of_the_down_book():
+    """The situation you saw: fair Up 0.316 / Down 0.684, book Up 0.29/0.30 (Down 0.70/0.71)."""
+    up_bid, down_bid = _entries(0.316, (0.29, 0.30))
+    assert abs(up_bid - 0.29) < 1e-9
+    assert abs(down_bid - 0.70) < 1e-9                        # was 0.66, four cents behind the Down book: never filled
+
+
+def test_without_touch_mode_the_down_bid_stays_behind_the_book_old_behaviour():
+    _, down_bid = _entries(0.316, (0.29, 0.30), tol=0.0)
+    assert down_bid < 0.68
+
+
+def test_touch_join_is_capped_by_the_model_not_unlimited():
+    # book Down bid 0.75 is 6.6c above fair Down 0.684: too dear, so we do NOT chase it
+    _, down_bid = _entries(0.316, (0.24, 0.25))
+    assert down_bid <= 0.684 + 0.02 + 1e-9
+
+
+def test_both_sides_are_symmetric_when_the_book_is_symmetric_around_fair():
+    for f in (0.2, 0.35, 0.5, 0.65, 0.8):
+        up, dn = _entries(f, (f - 0.005, f + 0.005))
+        up2, dn2 = _entries(1 - f, (1 - f - 0.005, 1 - f + 0.005))
+        assert abs(up - dn2) < 0.011 and abs(dn - up2) < 0.011
+
+
+def test_touch_quotes_never_cross_the_book():
+    for f in (0.1, 0.3, 0.5, 0.7, 0.9):
+        for bb, ba in ((f - 0.03, f - 0.02), (f + 0.02, f + 0.03), (f - 0.005, f + 0.005)):
+            q = {x.intent: x for x in yes_quotes(fair=f, half=0.02, tick=0.01, pos=0.0, cfg=HourlyConfig(), book=(bb, ba), touch_tol=0.02)}
+            if BUY_LONG in q:
+                assert q[BUY_LONG].price < ba - 1e-9
+            if BUY_SHORT in q:
+                assert q[BUY_SHORT].price > bb + 1e-9

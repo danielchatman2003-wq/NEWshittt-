@@ -104,3 +104,49 @@ def test_lone_leg_is_held_if_exit_would_dump_far_below_fair():
 def test_log_formatting_handles_a_missing_side_of_the_book():
     from polymarket_mm.pairmaker15 import _f
     assert _f(None).strip() == "--" and _f(0.3) == "0.300"
+
+
+# ---- money limits and directional loading -------------------------------------------------------------------
+from polymarket_mm.pairmaker15 import choose_plan, direction_edge, leg_sizes, pair_cost, phase  # noqa: E402
+
+
+def test_direction_edge_and_leg_sizes():
+    kb, pb = book(0.38, 0.40), book(0.38, 0.40)                       # books mid 0.39
+    assert direction_edge(kb, pb, 0.43) == pytest.approx(0.04)
+    assert leg_sizes(0.04, CFG) == (2.0, 1.0)                          # model likes Up: load Up
+    assert leg_sizes(-0.04, CFG) == (1.0, 2.0)                         # model likes Down: load Down
+    assert leg_sizes(0.01, CFG) == (1.0, 1.0)                          # too close to call: no lean
+    assert leg_sizes(None, CFG) == (1.0, 1.0)
+
+
+def test_loaded_pair_keeps_the_direction_and_respects_the_margin():
+    kb, pb = book(0.38, 0.40), book(0.38, 0.40)
+    m, name, up, dn = choose_plan(kb, pb, 0.43, PairConfig(tol=0.10))
+    assert up.qty == 2.0 and dn.qty == 1.0                             # Up favoured -> the Up leg is the big one
+    assert m >= CFG.min_margin - 1e-9
+
+
+def test_money_cap_trims_the_loaded_size_then_refuses():
+    kb, pb = book(0.38, 0.40), book(0.38, 0.40)
+    loaded = choose_plan(kb, pb, 0.43, PairConfig(tol=0.10, max_capital=10))
+    assert pair_cost(loaded[2], loaded[3]) == pytest.approx(2 * 0.38 + 0.60)   # the loaded cost: 1.36
+    tight = choose_plan(kb, pb, 0.43, PairConfig(tol=0.10, max_capital=1.05))
+    assert tight[2].qty == 1.0 and tight[3].qty == 1.0                 # loaded size did not fit: falls back to base size
+    assert pair_cost(tight[2], tight[3]) <= 1.05
+    assert choose_plan(kb, pb, 0.43, PairConfig(tol=0.10, max_capital=0.50)) is None    # nothing fits: no trade
+
+
+def test_phase_classification():
+    assert phase({K: 0.0, P: 0.0}) == "flat"
+    assert phase({K: 1.0, P: 0.0}) == "lone" and phase({K: 0.0, P: -1.0}) == "lone"
+    assert phase({K: 2.0, P: -1.0}) == "paired"                        # a loaded pair is still 'paired': both legs filled
+
+
+def test_kill_switch_trips_on_session_loss_paper():
+    m = make_maker()
+    m.cfg = PairConfig(max_loss=1.0)
+    m.live, m.killed, m.total_pnl, m.pm = False, False, -0.4, None
+    assert not m._check_loss(0.0) and not m.killed
+    m.total_pnl = -1.2
+    assert m._check_loss(0.0) and m.killed
+    assert all(not b.open_orders() for b in m.brokers.values())

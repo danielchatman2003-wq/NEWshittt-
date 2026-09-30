@@ -39,6 +39,12 @@ class PairConfig:
     min_p: float = 0.10
     max_p: float = 0.90
     loop_hz: float = 4.0
+    # --- money limits (hard) ---
+    max_capital: float = 2.0       # most money committed to ONE window's pair (both venues, both legs, incl. the loaded size)
+    max_loss: float = 1.0          # session kill switch: stop quoting and cancel everything once down this much
+    # --- directional loading ---
+    lean_edge: float = 0.02        # model fair vs the books' mid must differ by this much to pick a direction
+    lean_extra: float = 1.0        # extra size (in multiples of `size`) loaded onto the favoured side's leg
 
 
 @dataclass(frozen=True)
@@ -58,14 +64,44 @@ def _f(x) -> str:
     return "  -- " if x is None else f"{x:.3f}"
 
 
-def plan_entry(kb, pb, fair: float, cfg: PairConfig):
+def direction_edge(kb, pb, fair: float) -> float | None:
+    """Model minus market for Up: fair - average of the two books' mids. >0: the model thinks Up is underpriced."""
+    mids = [b.mid for b in (kb, pb) if b is not None and b.mid is not None]
+    return fair - sum(mids) / len(mids) if mids else None
+
+
+def leg_sizes(edge: float | None, cfg: PairConfig) -> tuple[float, float]:
+    """(up_qty, down_qty). Directional loading: extra size on the side the model favours, base size on the other."""
+    if edge is None:
+        return cfg.size, cfg.size
+    extra = cfg.size * cfg.lean_extra
+    if edge >= cfg.lean_edge:
+        return cfg.size + extra, cfg.size
+    if edge <= -cfg.lean_edge:
+        return cfg.size, cfg.size + extra
+    return cfg.size, cfg.size
+
+
+def pair_cost(up: "Leg", dn: "Leg") -> float:
+    """Money committed if both legs fill (each leg pays its own side's price)."""
+    return up.side_price * up.qty + dn.side_price * dn.qty
+
+
+def phase(net: dict) -> str:
+    """flat: nothing held | lone: exactly one venue holds a leg | paired: both venues hold one (the normal end state)."""
+    held = [v for v, q in net.items() if abs(q) > 1e-9]
+    return "flat" if not held else "lone" if len(held) == 1 else "paired"
+
+
+def plan_entry(kb, pb, fair: float, cfg: PairConfig, up_qty: float | None = None, dn_qty: float | None = None):
     """Best pairing of two resting maker bids, or None. kb/pb are the two venues' YES books.
     Combo A: Up bid at Kalshi's best bid + Down bid at Polymarket's best Down bid (= YES ask). Combo B: the reverse."""
     if None in (kb.best_bid, kb.best_ask, pb.best_bid, pb.best_ask):
         return None
+    uq, dq = (up_qty or cfg.size), (dn_qty or cfg.size)
     options = {
-        "Up@Kalshi+Down@Polymarket": (Leg(K, BUY_LONG, kb.best_bid, cfg.size), Leg(P, BUY_SHORT, pb.best_ask, cfg.size)),
-        "Up@Polymarket+Down@Kalshi": (Leg(P, BUY_LONG, pb.best_bid, cfg.size), Leg(K, BUY_SHORT, kb.best_ask, cfg.size)),
+        "Up@Kalshi+Down@Polymarket": (Leg(K, BUY_LONG, kb.best_bid, uq), Leg(P, BUY_SHORT, pb.best_ask, dq)),
+        "Up@Polymarket+Down@Kalshi": (Leg(P, BUY_LONG, pb.best_bid, uq), Leg(K, BUY_SHORT, kb.best_ask, dq)),
     }
     best = None
     for name, (up, dn) in options.items():
@@ -80,20 +116,58 @@ def plan_entry(kb, pb, fair: float, cfg: PairConfig):
     return best
 
 
+def choose_plan(kb, pb, fair: float, cfg: PairConfig):
+    """The pair to rest right now, sized by direction and trimmed to the money cap; None if nothing fits."""
+    uq, dq = leg_sizes(direction_edge(kb, pb, fair), cfg)
+    for up_qty, dn_qty in ((uq, dq), (cfg.size, cfg.size)):             # try the loaded size first, then the base size
+        plan = plan_entry(kb, pb, fair, cfg, up_qty, dn_qty)
+        if plan and pair_cost(plan[2], plan[3]) <= cfg.max_capital + 1e-9:
+            return plan
+    return None
+
+
 class PairMaker:
-    def __init__(self, cfg: PairConfig, us: UsAuth, kal: KalshiAuth, brti: BrtiFeed, sampler: SecondSampler):
+    def __init__(self, cfg: PairConfig, us: UsAuth, kal: KalshiAuth, brti: BrtiFeed, sampler: SecondSampler,
+                 prest=None, krest=None):
         self.cfg, self.us, self.kal, self.brti, self.sampler = cfg, us, kal, brti, sampler
+        self.prest, self.krest, self._k_ticker = prest, krest, None
         self.kfeed = KalshiBookFeed(kal)
         self.pm = None
         self.pfeed: UsBookFeed | None = None
-        self.brokers = {K: PaperBroker(maker_rebate=-0.0175, taker_fee=0.07), P: PaperBroker()}
+        self.brokers = {} if (prest is not None and krest is not None) else {K: PaperBroker(maker_rebate=-0.0175, taker_fee=0.07), P: PaperBroker()}
         self._lock = threading.Lock()
         self.stop = threading.Event()
+        self.live = prest is not None and krest is not None
+        self.killed = False
+        self._last_cash = 0.0
+        self._equity0: float | None = None
         self.first_fill: float | None = None
         self.total_pnl, self.windows, self.stats = 0.0, 0, {"pairs": 0, "legged": 0, "no_fill": 0}
         self._last_log = 0.0
 
     # ---- helpers ---------------------------------------------------------------------------------------------
+    def _cash(self) -> float:
+        pm = float(self.prest.call("GET", "/v1/account/balances")["balances"][0]["currentBalance"])
+        ka = float(self.krest.call("GET", "/portfolio/balance")["balance"]) / 100.0
+        return pm + ka
+
+    def _ensure_brokers(self, km) -> bool:
+        """Live only: build this window's brokers once Kalshi's feed is on the same market as Polymarket's."""
+        if not self.live or (self.brokers and self._k_ticker == km.ticker):
+            return True
+        if abs(km.close_ts - self.pm.window_end) > 3:
+            return False
+        end = self.pm.window_end - self.cfg.stop_before_end
+        from .kalshi_broker import KalshiLiveBroker
+        from .us_broker import LiveBroker
+        self.brokers = {K: KalshiLiveBroker(self.krest, km.ticker, expire_at=end), P: LiveBroker(self.prest, self.pm.slug, expire_at=end)}
+        self._k_ticker = km.ticker
+        for b in self.brokers.values():
+            b.cancel_all()
+        log.warning("LIVE brokers ready: %s + %s | positions K %+g P %+g | cash $%.2f", km.ticker, self.pm.slug[-16:],
+                    self.brokers[K].position(), self.brokers[P].position(), self._cash())
+        return True
+
     def _net(self) -> dict:
         return {v: b.position() for v, b in self.brokers.items()}
 
@@ -115,6 +189,8 @@ class PairMaker:
         self.kfeed.on_update = self._on_book(K)
         for b in self.brokers.values():
             b.cancel_all()
+        if self.live:
+            self.brokers, self._k_ticker = {}, None      # fresh live brokers per window (per-market tickers/slugs)
         self.first_fill = None
         log.info("=== window %s (ref %s) ===", nxt.slug[-16:], nxt.price_to_beat)
         return True
@@ -126,6 +202,12 @@ class PairMaker:
             log.warning("cannot settle (missing BRTI data)")
             return
         up = end_avg >= ref
+        if self.live:
+            cash = self._cash()
+            self.windows += 1
+            log.info("WINDOW END %s -> %s | cash $%.2f (session start $%.2f => %+.2f)", m.slug[-16:], "UP" if up else "DOWN",
+                     cash, self._equity0 or 0.0, cash - (self._equity0 or cash))
+            return
         n = {v: b.pos for v, b in self.brokers.items()}
         fills = sum(len(b.fills) for b in self.brokers.values())
         pnl = sum(b.settle(up) for b in self.brokers.values())
@@ -155,28 +237,67 @@ class PairMaker:
             return
         if abs(km.reference - ref) > 0.005:
             return                                     # the two venues must be the same contract: refuse if references differ
+        if not self._ensure_brokers(km):
+            return
         fair = fair_up(spot=spot, k=ref, now=now, window_end=m.window_end, sigma=self.sampler.sigma(now), sampler=self.sampler)
         net = self._net()
         total = net[K] + net[P]
         t_in = now - m.window_start
+        edge = direction_edge(kb, pb, fair)
         with self._lock:
-            # 1) a lone leg: wait for the partner, then exit
-            if abs(total) > 1e-9:
+            ph = phase(net)
+            if ph == "paired":                                   # both legs filled: done for this window, hold to settlement
+                for b in self.brokers.values():
+                    if b.open_orders():
+                        b.cancel_all()
+                if now - self._last_log > 15:
+                    log.info("T-%4.0fs PAIRED %s — holding to settlement (fair %.3f)", m.window_end - now, net, fair)
+                    self._last_log = now
+                return
+            if ph == "lone":                                     # 1) one leg filled: wait for the partner, then exit
                 if self.first_fill is None:
                     self.first_fill = now
                 if now - self.first_fill >= c.leg_timeout or now > m.window_end - c.stop_before_end:
                     self._exit_lone_leg(net, fair, kb, pb)
                 return
             self.first_fill = None
-            # 2) flat or fully hedged: rest a pair if the window/price is suitable
+            if self.killed or self._check_loss(now):
+                self._sync_orders(None)
+                return
+            # 2) flat: rest a pair if the window/price is suitable (one pair per window)
             quoting = (c.start_delay <= t_in <= (m.window_end - m.window_start) - c.stop_before_end
                        and c.min_p <= fair <= c.max_p)
-            plan = plan_entry(kb, pb, fair, c) if quoting and abs(net[K]) < 1e-9 and abs(net[P]) < 1e-9 else None
+            plan = choose_plan(kb, pb, fair, c) if quoting else None
             self._sync_orders(plan)
             if now - self._last_log > 10:
-                log.info("T-%4.0fs fair %.3f | K %s/%s  P %s/%s | %s", m.window_end - now, fair, _f(kb.best_bid), _f(kb.best_ask),
-                         _f(pb.best_bid), _f(pb.best_ask), f"PAIR {plan[1]} margin {plan[0] * 100:.1f}c" if plan else "no pair (margin/zone)")
+                side = "--" if edge is None else ("UP" if edge >= c.lean_edge else "DOWN" if edge <= -c.lean_edge else "neutral")
+                log.info("T-%4.0fs fair %.3f (model-vs-books %s%.1fc => %s) | K %s/%s  P %s/%s | %s", m.window_end - now, fair,
+                         "" if edge is None else "%+.1f" % (edge * 100), "", side, _f(kb.best_bid), _f(kb.best_ask),
+                         _f(pb.best_bid), _f(pb.best_ask),
+                         f"PAIR {plan[1]} margin {plan[0] * 100:.1f}c sizes {plan[2].qty:g}/{plan[3].qty:g} cost ${pair_cost(plan[2], plan[3]):.2f}" if plan else "no pair (margin/zone)")
                 self._last_log = now
+
+    def _check_loss(self, now: float) -> bool:
+        """Session kill switch. Paper: settled P&L. Live: cash now vs cash at start (only read while flat with nothing resting)."""
+        if self.cfg.max_loss <= 0:
+            return False
+        if self.live:
+            if any(b.open_orders() for b in self.brokers.values()) or now - self._last_cash < 30 or now - self.pm.window_start < 100:
+                return False                     # cash is only a clean measure when flat, nothing resting, and last window paid out
+            self._last_cash = now
+            loss = (self._equity0 - self._cash()) if self._equity0 is not None else 0.0
+        else:
+            loss = -self.total_pnl
+        if loss >= self.cfg.max_loss:
+            self.killed = True
+            log.critical("KILL SWITCH: session loss $%.2f >= limit $%.2f. No more orders this session.", loss, self.cfg.max_loss)
+            for b in self.brokers.values():
+                try:
+                    b.cancel_all()
+                except Exception:
+                    log.exception("cancel during kill switch failed")
+            return True
+        return False
 
     def _sync_orders(self, plan) -> None:
         want = {}
@@ -216,6 +337,10 @@ class PairMaker:
 
     def run(self) -> None:
         self.kfeed.start()
+        if self.live:
+            self._equity0 = self._cash()
+            log.warning("LIVE MODE: session start cash $%.2f (limits: capital/window $%.2f, loss stop $%.2f)", self._equity0,
+                        self.cfg.max_capital, self.cfg.max_loss)
         try:
             while not self.stop.is_set():
                 try:
@@ -237,6 +362,9 @@ class PairMaker:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--live", action="store_true", help="place REAL orders on both venues")
+    ap.add_argument("--max-capital", type=float, default=PairConfig.max_capital, help="most money committed to one window's pair")
+    ap.add_argument("--max-loss", type=float, default=PairConfig.max_loss, help="session kill switch: stop after losing this much")
     args = ap.parse_args()
     load_dotenv()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(message)s")
@@ -249,7 +377,13 @@ def main() -> None:
     brti = BrtiFeed(kal)
     brti.on_tick = lambda t: t.spot and sampler.add(t.local_ts, t.spot)
     brti.start()
-    maker = PairMaker(PairConfig(), us, kal, brti, sampler)
+    cfg = PairConfig(max_capital=args.max_capital, max_loss=args.max_loss)
+    prest = krest = None
+    if args.live:
+        from .kalshi_broker import KalshiRest
+        from .us_broker import UsRest
+        prest, krest = UsRest(us), KalshiRest(kal)
+    maker = PairMaker(cfg, us, kal, brti, sampler, prest, krest)
     import signal
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: maker.stop.set())

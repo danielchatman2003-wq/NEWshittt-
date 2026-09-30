@@ -252,8 +252,8 @@ class PaperBroker:
     it (best bid drops below our price); an ask fills when it trades UP through it. Deliberately
     conservative: it captures adverse selection (the real risk) and misses benign fills at the touch."""
 
-    def __init__(self, maker_rebate: float = 0.0125):
-        self.rebate = maker_rebate
+    def __init__(self, maker_rebate: float = 0.0125, taker_fee: float = 0.0695):
+        self.rebate, self.taker_fee = maker_rebate, taker_fee
         self._orders: dict[str, RestingOrder] = {}
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -272,7 +272,7 @@ class PaperBroker:
         with self._lock:
             buys = intent in BUYS_YES
             self.pos += qty if buys else -qty
-            self.cash += (-1 if buys else 1) * price * qty - 0.0695 * price * (1 - price) * qty
+            self.cash += (-1 if buys else 1) * price * qty - self.taker_fee * price * (1 - price) * qty
             self.fills.append((intent, price, qty))
         log.info("[paper] TAKE  %-9s %.2f x%g -> pos %+g", _short(intent), price, qty, self.pos)
         return True

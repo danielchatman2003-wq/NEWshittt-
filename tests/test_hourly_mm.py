@@ -390,16 +390,16 @@ def test_resting_order_more_aggressive_than_desired_is_replaced_but_one_tick_pas
     from polymarket_mm.hourly_mm import DesiredQuote
     from polymarket_mm.us_broker import RestingOrder
     # ask-like: desired 0.30. resting 0.29 is MORE aggressive (gives edge away) -> replace
-    m = _maker([RestingOrder("a", SELL_LONG, 0.29, 1.0)])
-    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    m = _maker([RestingOrder("a", BUY_SHORT, 0.29, 1.0)])
+    m._reconcile([DesiredQuote(BUY_SHORT, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
     assert m.broker.cancelled == ["a"]
     # resting 0.31 is one tick more passive -> keep
-    m = _maker([RestingOrder("b", SELL_LONG, 0.31, 1.0)])
-    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    m = _maker([RestingOrder("b", BUY_SHORT, 0.31, 1.0)])
+    m._reconcile([DesiredQuote(BUY_SHORT, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
     assert m.broker.cancelled == [] and m.broker.placed == []
     # two ticks more passive -> replace
-    m = _maker([RestingOrder("c", SELL_LONG, 0.32, 1.0)])
-    m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
+    m = _maker([RestingOrder("c", BUY_SHORT, 0.32, 1.0)])
+    m._reconcile([DesiredQuote(BUY_SHORT, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
     assert m.broker.cancelled == ["c"]
 
 
@@ -416,3 +416,42 @@ def test_quoting_skips_the_weak_first_fifteen_minutes():
     assert m._quoteable(10_000 + 600) == "waiting for window open"      # minute 10: sit out
     assert m._quoteable(10_000 + 901) is None                            # minute 15+: quote
     assert m._quoteable(13_600 - 100) == "final minutes"                 # still stops before expiry
+
+
+# ---- exits use the real book and stop chasing -------------------------------------------------------------
+def test_exit_joins_the_best_ask_instead_of_quoting_above_the_book():
+    # the live snapshot: Up book 0.41 / 0.42, model fair 0.433; we hold 1 Up
+    cfg = HourlyConfig()
+    no_book = {x.intent: x for x in yes_quotes(fair=0.433, half=0.02, tick=0.01, pos=1.0, cfg=cfg)}[SELL_LONG].price
+    with_book = {x.intent: x for x in yes_quotes(fair=0.433, half=0.02, tick=0.01, pos=1.0, cfg=cfg, book=(0.41, 0.42))}[SELL_LONG].price
+    assert abs(with_book - 0.42) < 1e-9 and with_book <= no_book      # joins the best ask
+
+
+def test_exit_never_crosses_the_bid_and_never_dumps_below_fair_minus_slack():
+    cfg = HourlyConfig()
+    # book far below fair (book very bearish): don't give it away, wait at fair - slack
+    p = {x.intent: x for x in yes_quotes(fair=0.60, half=0.02, tick=0.01, pos=1.0, cfg=cfg, book=(0.30, 0.31))}[SELL_LONG].price
+    assert p >= 0.60 - cfg.exit_slack - 1e-9
+    # a tight book: exit must stay strictly above the best bid
+    p = {x.intent: x for x in yes_quotes(fair=0.40, half=0.02, tick=0.01, pos=1.0, cfg=cfg, book=(0.40, 0.41))}[SELL_LONG].price
+    assert p > 0.40
+
+
+def test_down_exit_mirrors_it():
+    cfg = HourlyConfig()
+    q = {x.intent: x for x in yes_quotes(fair=0.567, half=0.02, tick=0.01, pos=-1.0, cfg=cfg, book=(0.40, 0.41))}
+    assert SELL_SHORT in q and q[SELL_SHORT].price < 0.41            # YES-price of selling Down: below the YES best ask
+
+
+def test_sticky_exit_does_not_chase_a_slow_drift_but_entries_still_requote():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("x", SELL_LONG, 0.44, 1.0)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.41, 1.0)], 0.01, fair=0.42, half=0.02)    # desired fell 3 ticks: hold
+    assert m.broker.cancelled == [] and m.broker.placed == []
+    m = _maker([RestingOrder("x", SELL_LONG, 0.46, 1.0)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.41, 1.0)], 0.01, fair=0.42, half=0.02)    # 5 ticks: now re-price
+    assert m.broker.cancelled == ["x"]
+    m = _maker([RestingOrder("b", BUY_LONG, 0.40, 1.0)])
+    m._reconcile([DesiredQuote(BUY_LONG, 0.43, 1.0)], 0.01, fair=0.45, half=0.02)     # entries stay tight (1 tick)
+    assert m.broker.cancelled == ["b"]

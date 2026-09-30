@@ -47,6 +47,8 @@ class HourlyConfig:
     fill_widen_seconds: float = 30.0
     trend_window: float = 3.0     # also widen by how far fair value moved over this many seconds
     trend_cap: float = 0.05
+    exit_slack: float = 0.02      # an exit may sell up to this far below fair (to join the book and actually fill)
+    exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
 
@@ -59,7 +61,7 @@ class DesiredQuote:
 
 
 def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: HourlyConfig,
-               min_qty: float = 0.01) -> list[DesiredQuote]:
+               min_qty: float = 0.01, book: tuple[float | None, float | None] | None = None) -> list[DesiredQuote]:
     """Quotes in YES-price space. Inventory is unwound first, new exposure only opened when flat that side:
        bid side: SELL_SHORT (close NO) if pos<0 else BUY_LONG;   ask side: SELL_LONG if pos>0 else BUY_SHORT."""
     t = _d(tick)
@@ -70,13 +72,27 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     ask = _ceil(center + _d(half), t)
     if bid < t or ask > 1 - t or bid >= ask:
         return []
+    # Exits are priced off the REAL book (best_bid, best_ask of the YES book): join the top of the book on our side so
+    # we actually get filled, but never give away more than exit_slack below fair, and never cross (post-only).
+    bb, ba = (book or (None, None))
+    if bb is not None and ba is not None:
+        slack = _d(cfg.exit_slack)
+        lo_ask = _ceil(_d(round(fair, 6)) - slack, t)                 # lowest price we'll sell Up for
+        exit_ask = min(ask, max(_ceil(_d(ba), t), lo_ask))            # join best ask, bounded by slack and our normal ask
+        exit_ask = max(exit_ask, _d(bb) + t)                          # never at/below the best bid (would cross)
+        hi_bid = _floor(_d(round(fair, 6)) + slack, t)                # highest price we'll pay to buy back Up / sell Down
+        exit_bid = max(bid, min(_floor(_d(bb), t), hi_bid))           # join best bid, bounded by slack and our normal bid
+        exit_bid = min(exit_bid, _d(ba) - t)
+        exit_bid, exit_ask = (exit_bid if exit_bid < exit_ask else bid), (exit_ask if exit_bid < exit_ask else ask)
+    else:
+        exit_bid, exit_ask = bid, ask
     out: list[DesiredQuote] = []
     if pos < -min_qty:
-        out.append(DesiredQuote(SELL_SHORT, float(bid), min(cfg.size, -pos)))
+        out.append(DesiredQuote(SELL_SHORT, float(exit_bid), min(cfg.size, -pos)))
     elif cfg.max_pos - pos >= min_qty:
         out.append(DesiredQuote(BUY_LONG, float(bid), min(cfg.size, cfg.max_pos - pos)))
     if pos > min_qty:
-        out.append(DesiredQuote(SELL_LONG, float(ask), min(cfg.size, pos)))
+        out.append(DesiredQuote(SELL_LONG, float(exit_ask), min(cfg.size, pos)))
     elif cfg.max_pos + pos >= min_qty:
         out.append(DesiredQuote(BUY_SHORT, float(ask), min(cfg.size, cfg.max_pos + pos)))
     return out
@@ -227,13 +243,16 @@ class HourlyMaker:
         have = self.broker.open_orders()
         keep_ids, todo = set(), list(want)
         eps = tick * 0.01
+        cfg = getattr(self, 'cfg', None) or HourlyConfig()
         for o in have:
             for q in todo:
                 if q.intent != o.intent or not (0.5 * q.qty <= o.qty <= q.qty + 1e-9):
                     continue
                 bidlike = o.intent in (BUY_LONG, SELL_SHORT)          # rests below the market in YES-price space
                 passive_by = (q.price - o.price) if bidlike else (o.price - q.price)   # >0: resting is more passive
-                if -eps <= passive_by <= tick + eps:
+                is_exit = o.intent in (SELL_LONG, SELL_SHORT)
+                room = (cfg.exit_ticks if is_exit else 1) * tick   # exits hold their place in the queue
+                if -eps <= passive_by <= room + eps:
                     todo.remove(q)
                     keep_ids.add(o.id)
                     break
@@ -288,7 +307,9 @@ class HourlyMaker:
             half = self._half(now, spot, sigma, fair) + extra_half(
                 now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
             self._fair_hist.append((now, fair))
-            want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty)
+            bk = self.book_feed.book(m.slug)
+            want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
+                              book=(bk.best_bid, bk.best_ask) if bk else None)
             self._reconcile(want, m.tick, fair, half)
             self._quoted_fair, self._quoted_half = fair, half
             if now - self._last_log > 5:

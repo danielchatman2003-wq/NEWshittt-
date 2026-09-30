@@ -34,11 +34,11 @@ def _ts(iso: str) -> float:
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
-def parse_hourly(m: dict) -> HourlyMarket | None:
-    """Accept only a BTC / BRTI / 1h / UP_DOWN market, validated by fields (not by the slug)."""
+def parse_updown(m: dict, horizon: str = "1h") -> HourlyMarket | None:
+    """Accept only a BTC / BRTI / UP_DOWN market of the given horizon ("1h" or "15m"), validated by fields (not the slug)."""
     t = m.get("assetPriceTerms") or {}
     if (t.get("marketType") != "ASSET_PRICE_MARKET_TYPE_UP_DOWN" or t.get("indexSymbol") != "BRTI"
-            or t.get("horizon") != "1h" or (t.get("asset") or {}).get("symbol") != "btc"):
+            or t.get("horizon") != horizon or (t.get("asset") or {}).get("symbol") != "btc"):
         return None
     ptb = (t.get("priceToBeat") or {}).get("value")
     return HourlyMarket(
@@ -49,18 +49,32 @@ def parse_hourly(m: dict) -> HourlyMarket | None:
     )
 
 
-def find_current(auth: UsAuth, now: float | None = None, session=None) -> HourlyMarket | None:
-    """The 1h market whose window contains `now` (else the next one that hasn't started)."""
+def parse_hourly(m: dict) -> HourlyMarket | None:
+    return parse_updown(m, "1h")
+
+
+def candidate_slugs(now: float, horizon: str = "1h") -> list[str]:
+    """Slugs of the window containing `now` and the next one. (Docs call the slug format non-contractual, so every
+    candidate is validated by its fields after fetching.)"""
+    step = {"1h": 60, "15m": 15}[horizon]
+    t = datetime.fromtimestamp(now, timezone.utc)
+    base = t.replace(minute=(t.minute // step) * step if step < 60 else 0, second=0, microsecond=0)
+    out = []
+    for k in (0, 1):
+        h = base + timedelta(minutes=step * k)
+        out.append(f"cpc-btc-updown-{horizon}-{h:%Y-%m-%d-%H%M}z" if horizon == "15m" else f"cpc-btc-updown-1h-{h:%Y-%m-%d-%H}00z")
+    return out
+
+
+def find_current(auth: UsAuth, now: float | None = None, session=None, horizon: str = "1h") -> HourlyMarket | None:
+    """The market (1h or 15m) whose window contains `now` (else the next one that hasn't started)."""
     s = session or requests
     now = now or time.time()
-    base = datetime.fromtimestamp(now, timezone.utc).replace(minute=0, second=0, microsecond=0)
-    for k in (0, 1):
-        h = base + timedelta(hours=k)
-        slug = f"cpc-btc-updown-1h-{h:%Y-%m-%d-%H}00z"  # docs call the slug format non-contractual: validate by fields
+    for slug in candidate_slugs(now, horizon):
         path = f"/v1/market/slug/{slug}"
         r = s.get(REST + path, headers=auth.headers("GET", path), timeout=10)
         if r.status_code == 200:
-            hm = parse_hourly(r.json().get("market", {}))
+            hm = parse_updown(r.json().get("market", {}), horizon)
             if hm and hm.window_end > now:
                 return hm
     return None

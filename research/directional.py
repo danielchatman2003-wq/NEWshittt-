@@ -31,7 +31,7 @@ def asks_at(hist, offs, t0):
     return U, D
 
 
-def main():
+def main(tmin=0, tmax=bt.HOUR - 150, label="all of the window"):
     s0, g = bt.load()
     gf = bt.ffill(g)
     wins = bt.windows(g, s0)
@@ -52,13 +52,15 @@ def main():
         p = stats.norm.cdf((gf[idx] - float(ptb)) / sd)
         U, D = asks_at(hist, offs, w["t0"])
         data.append((p, U, D, w["up"]))
-    print(f"{len(data)} windows with model + executable market prices\n")
+    print(f"\n=== entering only {label} ({len(data)} windows with model + executable market prices) ===")
     rng = np.random.default_rng(1)
     print(f"{'min edge':>9} {'trades':>7} {'win%':>6} {'avg cost':>9} {'net P&L/contract':>17}   95% CI (bootstrap over trades)    Up-buys / Down-buys")
     for X in (0.02, 0.04, 0.06, 0.08, 0.10, 0.15):
         pnl, sides, costs = [], [], []
         for p, U, D, up in data:
             for i in range(len(p)):
+                if not (tmin <= offs[i] <= tmax):
+                    continue
                 if np.isnan(U[i]) or np.isnan(D[i]) or not (0.03 <= U[i] <= 0.97):
                     continue
                 e_up, e_dn = p[i] - U[i], (1 - p[i]) - D[i]
@@ -79,3 +81,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    main(1800, bt.HOUR - 150, "in the second half (30-57 min)")
+    main(2700, bt.HOUR - 150, "in the last 15 minutes (45-57 min)")
+    main(3150, bt.HOUR - 150, "in the last 5 minutes before the quoting cutoff (52-57 min)")

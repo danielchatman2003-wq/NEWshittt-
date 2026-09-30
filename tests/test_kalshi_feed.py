@@ -81,3 +81,18 @@ def test_polymarket_15m_slugs_and_horizon_validation():
                              "windowEnd": "2026-09-30T19:00:00Z", "priceToBeat": {"value": "83837.45"}}}
     assert parse_updown(m, "15m").window_end - parse_updown(m, "15m").window_start == 900
     assert parse_updown(m, "1h") is None
+
+
+def test_pair_costs_and_fees_math():
+    from polymarket_mm.pairs15 import K_FEE, PM_FEE, fee, pair_costs
+    from polymarket_mm.us_feed import UsBook
+    pm = UsBook("p", bids=[(0.49, 10)], asks=[(0.51, 10)])
+    ka = UsBook("k", bids=[(0.48, 10)], asks=[(0.50, 10)])
+    c = pair_costs(pm, ka)
+    a, b = c["A Up@Kalshi+Down@PM"], c["B Up@PM+Down@Kalshi"]
+    assert a[0] == pytest.approx(0.50 + (1 - 0.49)) and b[0] == pytest.approx(0.51 + (1 - 0.48))   # 1.01 and 1.03
+    assert a[1] == pytest.approx(fee(K_FEE, 0.50) + fee(PM_FEE, 0.51))
+    assert a[2] == pytest.approx(a[0] + a[1]) and a[2] > 1                     # a normal pair is a LOSS after fees
+    crossed = pair_costs(UsBook("p", bids=[(0.55, 1)], asks=[(0.56, 1)]), UsBook("k", bids=[(0.50, 1)], asks=[(0.52, 1)]))
+    assert crossed["A Up@Kalshi+Down@PM"][0] < 1                               # PM bid 0.55 > Kalshi ask 0.52: gross < $1
+    assert pair_costs(pm, UsBook("k", bids=[], asks=[])) is None

@@ -71,6 +71,32 @@ def pressure(bk, flow_imbalance: float) -> float:
     return (depth_imbalance(bk) + micro_skew(bk) + flow_imbalance) / 3.0
 
 
+class PressureModel:
+    """Pressure measured as a DEPARTURE from each book's own recent norm. A book can be structurally ask-heavy (lottery-ticket
+    prices, a resting wall) without price being about to fall; only a change in the lean is information. Depth imbalance and
+    microprice skew are baselined with an EWMA (time constant `tau` seconds); trade flow is already a flow, so it is not."""
+
+    def __init__(self, tau: float = 60.0):
+        self.tau = tau
+        self._t: float | None = None
+        self._bi = self._bs = 0.0
+        self._warm = 0
+
+    def update(self, now: float, bk, flow_imbalance: float) -> float:
+        import math
+        i, s = depth_imbalance(bk), micro_skew(bk)
+        if self._t is None:
+            self._bi, self._bs = i, s                    # first look: assume the current lean is normal
+        else:
+            a = 1 - math.exp(-max(0.0, now - self._t) / self.tau)
+            self._bi += a * (i - self._bi)
+            self._bs += a * (s - self._bs)
+        self._t = now
+        self._warm += 1
+        di, ds = max(-1.0, min(1.0, i - self._bi)), max(-1.0, min(1.0, s - self._bs))
+        return (di + ds + flow_imbalance) / 3.0
+
+
 class ToxicityGate:
     """Trip when pressure reaches +/-trip; clear only when it falls back inside +/-rearm (hysteresis); then stay blocked
     for `cooldown` more seconds. block_up_bids: down pressure, so don't rest UP bids. block_down_bids: up pressure."""

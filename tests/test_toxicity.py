@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from polymarket_mm.toxicity import (MarkoutTracker, ToxicityGate, TradeFlow, depth_imbalance, micro_skew, parse_trade,
+from polymarket_mm.toxicity import (MarkoutTracker, PressureModel, ToxicityGate, TradeFlow, depth_imbalance, micro_skew, parse_trade,
                                     pressure)
 from polymarket_mm.us_feed import UsBook
 
@@ -79,7 +79,8 @@ def make_maker():
     from polymarket_mm.us_broker import PaperBroker
     m = object.__new__(HourlyMaker)
     m.cfg, m.broker, m._lock = HourlyConfig(), PaperBroker(), threading.Lock()
-    m.gate = ToxicityGate(); m.flow = TradeFlow(); m._pressure = 0.0; m._pulls = 0
+    m.gate = ToxicityGate(); m.flow = TradeFlow(); m._pressure = 0.0; m._pulls = 0; m.pmodel = PressureModel()
+    m.pmodel.update(__import__('time').time() - 5, BALANCED, 0.0)          # the book was balanced just before: a real change
     return m
 
 
@@ -111,3 +112,20 @@ def test_balanced_book_pulls_nothing():
     m.broker.place(BUY_LONG, 0.10, 1.0); m.broker.place(BUY_SHORT, 0.11, 1.0)
     m._on_book(BALANCED)
     assert len(m.broker.open_orders()) == 2 and m._pulls == 0
+
+
+
+# ---- a structurally lopsided book is NOT a signal; a CHANGE in the lean is ------------------------------------------
+def test_permanently_ask_heavy_book_does_not_keep_blocking_one_side():
+    pm = PressureModel(tau=60)
+    ps = [pm.update(t, ASK_HEAVY, 0.0) for t in range(0, 120, 2)]       # same lopsided book for two minutes
+    assert abs(ps[0]) < 1e-9                                            # first look: that lean is 'normal'
+    assert max(abs(p) for p in ps) < 0.25                               # never trips the gate on a constant lean
+
+
+def test_a_sudden_change_in_the_lean_is_a_signal():
+    pm = PressureModel(tau=60)
+    for t in range(0, 120, 2):
+        pm.update(t, BALANCED, 0.0)                                     # calm, balanced
+    p = pm.update(121, ASK_HEAVY, -0.9)                                 # book turns ask-heavy AND sellers start hitting bids
+    assert p < -0.45                                                    # trips the gate

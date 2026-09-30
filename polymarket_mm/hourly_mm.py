@@ -22,7 +22,7 @@ from .model import SecondSampler, fair_up
 from .quoter import _ceil, _d, _floor
 from .us_broker import (BUY_LONG, BUY_SHORT, SELL_LONG, SELL_SHORT, LiveBroker, PaperBroker, UsRest,
                         order_body)
-from .toxicity import MarkoutTracker, ToxicityGate, TradeFlow, parse_trade, pressure
+from .toxicity import MarkoutTracker, PressureModel, ToxicityGate, TradeFlow, parse_trade
 from .us_feed import UsAuth, UsBookFeed
 
 log = logging.getLogger(__name__)
@@ -232,6 +232,7 @@ class HourlyMaker:
         self._last_log = 0.0
         self.budget = DirectionBudget(cfg)
         self.gate = ToxicityGate(cfg.tox_trip, cfg.tox_rearm, cfg.tox_cooldown)
+        self.pmodel = PressureModel()
         self.flow = TradeFlow(cfg.flow_window)
         self.markout = MarkoutTracker(cfg.markout_horizon)
         self._pressure = 0.0
@@ -314,7 +315,7 @@ class HourlyMaker:
         if not self.cfg.tox_on or self.broker is None or book.best_bid is None or book.best_ask is None:
             return
         now = time.time()
-        self._pressure = pressure(book, self.flow.imbalance(now))
+        self._pressure = self.pmodel.update(now, book, self.flow.imbalance(now))
         _, _, new_down, new_up = self.gate.update(now, self._pressure)
         if new_down or new_up:                # flow just turned against one side: pull that entry within one book update
             doomed = BUY_LONG if new_down else BUY_SHORT          # down pressure endangers Up bids; up pressure, Down bids
@@ -486,7 +487,7 @@ class HourlyMaker:
             self._fair_hist.append((now, fair))
             tox_up = tox_down = False
             if self.cfg.tox_on and bk:
-                self._pressure = pressure(bk, self.flow.imbalance(now))
+                self._pressure = self.pmodel.update(now, bk, self.flow.imbalance(now))
                 tox_up, tox_down, _, _ = self.gate.update(now, self._pressure)    # block Up bids on down pressure, Down bids on up
             paused = now < self._pause_until
             want = yes_quotes(fair=fair_q, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,

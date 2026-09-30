@@ -143,6 +143,11 @@ class LiveBroker:
         self._warned = 0.0
         self.fault: str | None = None  # set if the exchange's position contradicts our fills (e.g. sign flipped)
 
+    def poke(self) -> None:
+        """A push (private websocket) says something changed: make the next read go to REST now instead of waiting for
+        the ~1s timer. REST is still the source of truth; this only removes the polling delay."""
+        self._last = 0.0
+
     def _refresh(self, force: bool = False) -> None:
         if not force and time.monotonic() - self._last < self.refresh:
             return

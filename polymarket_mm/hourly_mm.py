@@ -24,6 +24,7 @@ from .us_broker import (BUY_LONG, BUY_SHORT, SELL_LONG, SELL_SHORT, LiveBroker, 
                         order_body)
 from .toxicity import MarkoutTracker, PressureModel, ToxicityGate, TradeFlow, parse_trade
 from .us_feed import UsAuth, UsBookFeed
+from .us_private_feed import UsPrivateFeed
 
 log = logging.getLogger(__name__)
 
@@ -219,6 +220,7 @@ class HourlyMaker:
         self.cfg, self.us, self.brti, self.sampler, self.rest = cfg, us, brti, sampler, live_rest
         self.mkt: HourlyMarket | None = None
         self.book_feed: UsBookFeed | None = None
+        self.priv_feed: UsPrivateFeed | None = None
         self.broker = None
         self._lock = threading.Lock()  # serialises broker calls between the main loop and the BRTI thread
         self._quoted_fair: float | None = None
@@ -342,6 +344,11 @@ class HourlyMaker:
         self.book_feed.on_trade = self._on_trade if self.cfg.tox_on else None
         self.book_feed.start()
         if self.rest:
+            if getattr(self, "priv_feed", None):
+                self.priv_feed.stop()
+            self.priv_feed = UsPrivateFeed(self.us, [nxt.slug])          # push: our own order/position updates
+            self.priv_feed.on_event = lambda _j: self.broker.poke() if hasattr(self.broker, "poke") else None
+            self.priv_feed.start()
             self.broker = LiveBroker(self.rest, nxt.slug, expire_at=nxt.window_end - self.cfg.stop_before_end)
             self.broker.cancel_all()  # start clean: nothing of ours resting from a previous run
             log.warning("LIVE on %s: position %+g, buying power $%s", nxt.slug, self.broker.position(), self.broker._bp)
@@ -548,6 +555,8 @@ class HourlyMaker:
             log.critical("COULD NOT CANCEL ON SHUTDOWN - CHECK OPEN ORDERS MANUALLY (they expire at the quoting deadline)")
         if self.book_feed:
             self.book_feed.stop()
+        if getattr(self, "priv_feed", None):
+            self.priv_feed.stop()
         self.brti.stop()
 
 

@@ -636,3 +636,63 @@ def test_spread_preset_is_in_and_out_fast():
     from polymarket_mm.hourly_mm import SPREAD_CFG
     assert SPREAD_CFG.exit_take_after <= 30 and SPREAD_CFG.exit_hold <= 10 and SPREAD_CFG.start_delay <= 300
     assert SPREAD_CFG.size == 1.0 and SPREAD_CFG.max_pos == 1.0        # still one contract at a time
+
+
+# ---- private websocket doorbell ------------------------------------------------------------------------------------
+def test_poke_makes_the_next_read_go_to_the_exchange_immediately():
+    from polymarket_mm.us_broker import LiveBroker
+    r = _FakeRest()
+    b = LiveBroker(r, "s", refresh=1000.0)            # timer would never fire on its own
+    b.open_orders()
+    n = len(r.calls)
+    b.open_orders()
+    assert len(r.calls) == n                           # cached: no new request
+    b.poke()                                           # a push arrives: something changed
+    b.open_orders()
+    assert len(r.calls) > n                            # re-read at once
+
+
+def test_private_feed_calls_back_on_order_frames_and_ignores_heartbeats():
+    import asyncio
+    import base64
+    import json
+    import threading
+
+    import websockets
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    from polymarket_mm.us_feed import UsAuth
+    from polymarket_mm.us_private_feed import UsPrivateFeed
+
+    subs = []
+
+    async def handler(ws):
+        subs.append(json.loads(await ws.recv())["subscribe"]["subscriptionType"])
+        subs.append(json.loads(await ws.recv())["subscribe"]["subscriptionType"])
+        await ws.send('{"heartbeat":{}}')
+        await ws.send(json.dumps({"orderSubscriptionUpdate": {"execution": {"type": "EXECUTION_TYPE_FILL"}}}))
+        await asyncio.sleep(1.5)
+
+    ready, port = threading.Event(), {}
+
+    def serve():
+        async def main():
+            async with websockets.serve(handler, "127.0.0.1", 0) as s:
+                port["p"] = s.sockets[0].getsockname()[1]
+                ready.set()
+                await asyncio.sleep(3)
+        asyncio.run(main())
+
+    threading.Thread(target=serve, daemon=True).start()
+    ready.wait(5)
+    k = ed25519.Ed25519PrivateKey.generate()
+    f = UsPrivateFeed(UsAuth("kid", base64.b64encode(k.private_bytes_raw()).decode()), ["m"], url=f"ws://127.0.0.1:{port['p']}")
+    got = []
+    f.on_event = got.append
+    f.start()
+    t0 = time.time()
+    while not got and time.time() - t0 < 3:
+        time.sleep(0.05)
+    f.stop()
+    assert subs == ["SUBSCRIPTION_TYPE_ORDER", "SUBSCRIPTION_TYPE_POSITION"]
+    assert len(got) == 1 and "orderSubscriptionUpdate" in got[0]        # the heartbeat did not ring the doorbell

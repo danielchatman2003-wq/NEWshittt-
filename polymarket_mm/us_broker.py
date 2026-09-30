@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import requests
 
@@ -56,9 +57,11 @@ class RateLimiter:
                 self._tokens -= 1
 
 
-def order_body(slug: str, intent: str, price: float, qty: float, tick_decimals: int = 2) -> dict:
-    """Maker-only GTC limit order. participateDontInitiate => rejected instead of ever taking (and paying fees)."""
-    return {
+def order_body(slug: str, intent: str, price: float, qty: float, tick_decimals: int = 2,
+               expire_at: float | None = None) -> dict:
+    """Maker-only limit order. participateDontInitiate => rejected instead of ever taking (and paying fees).
+    With expire_at (unix s) the order is GTD: if the bot dies, the exchange removes it by itself."""
+    body = {
         "marketSlug": slug,
         "type": "ORDER_TYPE_LIMIT",
         "price": {"value": f"{price:.{tick_decimals}f}", "currency": "USD"},
@@ -68,15 +71,20 @@ def order_body(slug: str, intent: str, price: float, qty: float, tick_decimals: 
         "participateDontInitiate": True,
         "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
     }
+    if expire_at is not None:
+        body["tif"] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+        body["goodTillTime"] = datetime.fromtimestamp(expire_at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return body
 
 
 class UsRest:
     def __init__(self, auth: UsAuth, rps: float = 10.0, session: requests.Session | None = None):
         self.auth, self.limiter, self.s = auth, RateLimiter(rps), session or requests.Session()
 
-    def call(self, method: str, path: str, params=None, body=None) -> dict:
+    def call(self, method: str, path: str, params=None, body=None, priority: bool = False) -> dict:
         for attempt in (0, 1):
-            self.limiter.acquire()
+            if not priority:  # cancels skip the queue: a pull must never wait behind polling
+                self.limiter.acquire()
             data = json.dumps(body, separators=(",", ":")) if body is not None else None
             headers = {**self.auth.headers(method, path), "Content-Type": "application/json"}  # signs path only
             r = self.s.request(method, REST + path, params=params, data=data, headers=headers, timeout=5)
@@ -94,32 +102,83 @@ class UsRest:
 
 
 class LiveBroker:
-    def __init__(self, rest: UsRest, slug: str):
-        self.rest, self.slug = rest, slug
+    """Real orders. Reads (open orders, position, buying power) are cached ~1s and our own places/cancels
+    update the cache immediately, so the 4Hz quoting loop costs ~3 requests/s, not 12."""
+
+    def __init__(self, rest: UsRest, slug: str, expire_at: float | None = None, refresh: float = 1.0):
+        self.rest, self.slug, self.expire_at, self.refresh = rest, slug, expire_at, refresh
+        self._orders: dict[str, RestingOrder] = {}
+        self._pos, self._bp = 0.0, None
+        self._last = 0.0
+        self._warned = 0.0
+        self.fault: str | None = None  # set if the exchange's position contradicts our fills (e.g. sign flipped)
+
+    def _refresh(self, force: bool = False) -> None:
+        if not force and time.monotonic() - self._last < self.refresh:
+            return
+        j = self.rest.call("GET", "/v1/orders/open", params={"slugs": self.slug})
+        fresh = {o["id"]: RestingOrder(o["id"], o.get("intent", ""), float(o["price"]["value"]),
+                                       float(o.get("leavesQuantity", o.get("quantity", 0))))
+                 for o in j.get("orders", [])}
+        pj = self.rest.call("GET", "/v1/portfolio/positions", params={"market": self.slug})
+        p = (pj.get("positions") or {}).get(self.slug)
+        pos = float(p["netPositionDecimal"]) if p else 0.0
+        try:
+            bj = self.rest.call("GET", "/v1/account/balances")
+            self._bp = float(bj["balances"][0]["buyingPower"])
+        except Exception:
+            pass  # keep the last known value
+        gone = [o for i, o in self._orders.items() if i not in fresh]  # filled (or expired) since last look
+        expected = sum(o.qty if o.intent in BUYS_YES else -o.qty for o in gone)
+        delta = pos - self._pos
+        if gone and abs(delta) > 1e-9 and expected * delta < 0:
+            self.fault = (f"position moved {delta:+g} but the orders that vanished imply {expected:+g}: "
+                          "position sign convention is not what we assumed - STOPPING")
+        self._orders, self._pos, self._last = fresh, pos, time.monotonic()
+
+    def _cost(self, intent: str, price: float, qty: float) -> float:
+        if intent == BUY_LONG:
+            return price * qty
+        if intent == BUY_SHORT:
+            return (1 - price) * qty
+        return 0.0  # closing orders need no new cash
 
     def place(self, intent: str, price: float, qty: float) -> str | None:
-        try:
-            resp = self.rest.call("POST", "/v1/orders", body=order_body(self.slug, intent, price, qty))
-            return resp.get("id")
-        except UsApiError as e:  # a rejected maker-only quote (would cross) must not kill the loop
-            log.warning("place %s %.2f x%s rejected: %s", intent, price, qty, e)
+        cost = self._cost(intent, price, qty)
+        if self._bp is not None and cost > self._bp:
+            if time.monotonic() - self._warned > 30:
+                log.warning("skip %s %.2f x%g: needs $%.2f, buying power $%.2f", intent[13:], price, qty, cost, self._bp)
+                self._warned = time.monotonic()
             return None
+        try:
+            resp = self.rest.call("POST", "/v1/orders", body=order_body(self.slug, intent, price, qty, expire_at=self.expire_at))
+        except UsApiError as e:  # a rejected maker-only quote (would cross) must not kill the loop
+            log.warning("place %s %.2f x%s rejected: %s", intent[13:], price, qty, e)
+            return None
+        oid = resp.get("id")
+        if oid:
+            self._orders[oid] = RestingOrder(oid, intent, price, qty)
+            if self._bp is not None:
+                self._bp -= cost
+            log.info("[LIVE] PLACE %-10s %.2f x%g  id=%s", intent[13:], price, qty, oid)
+        return oid
 
     def cancel(self, order_id: str) -> None:
-        self.rest.call("POST", f"/v1/order/{order_id}/cancel", body={})
+        self._orders.pop(order_id, None)
+        self.rest.call("POST", f"/v1/order/{order_id}/cancel", body={"marketSlug": self.slug}, priority=True)
 
     def cancel_all(self) -> None:
-        self.rest.call("POST", "/v1/orders/open/cancel", body={"slugs": [self.slug]})
+        self._orders.clear()
+        self.rest.call("POST", "/v1/orders/open/cancel", body={"slugs": [self.slug]}, priority=True)
+        self._last = 0.0  # re-read truth next time
 
     def open_orders(self) -> list[RestingOrder]:
-        j = self.rest.call("GET", "/v1/orders/open", params={"slugs": self.slug})
-        return [RestingOrder(o["id"], o.get("intent", ""), float(o["price"]["value"]),
-                             float(o.get("leavesQuantity", o.get("quantity", 0)))) for o in j.get("orders", [])]
+        self._refresh()
+        return list(self._orders.values())
 
     def position(self) -> float:
-        j = self.rest.call("GET", "/v1/portfolio/positions", params={"market": self.slug})
-        p = (j.get("positions") or {}).get(self.slug)
-        return float(p["netPositionDecimal"]) if p else 0.0
+        self._refresh()
+        return self._pos
 
 
 class PaperBroker:

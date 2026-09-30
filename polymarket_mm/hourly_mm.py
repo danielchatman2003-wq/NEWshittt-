@@ -171,7 +171,12 @@ class HourlyMaker:
         self.book_feed = UsBookFeed(self.us, [nxt.slug])
         self.book_feed.on_update = self._on_book
         self.book_feed.start()
-        self.broker = LiveBroker(self.rest, nxt.slug) if self.rest else PaperBroker()
+        if self.rest:
+            self.broker = LiveBroker(self.rest, nxt.slug, expire_at=nxt.window_end - self.cfg.stop_before_end)
+            self.broker.cancel_all()  # start clean: nothing of ours resting from a previous run
+            log.warning("LIVE on %s: position %+g, buying power $%s", nxt.slug, self.broker.position(), self.broker._bp)
+        else:
+            self.broker = PaperBroker()
         self._quoted_fair = None
         log.info("market %s  (%s mode)", nxt.slug, "LIVE" if self.rest else "paper")
         return True
@@ -191,15 +196,21 @@ class HourlyMaker:
         log.info("SETTLED %s: end_avg=%.2f K=%.2f -> %s | fills=%d paper P&L=$%.2f | session total=$%.2f",
                  m.slug, end_avg, k, "UP" if up else "DOWN", fills, pnl, self.total_pnl)
 
-    def _reconcile(self, want: list[DesiredQuote], tick: float) -> None:
+    def _reconcile(self, want: list[DesiredQuote], tick: float, fair: float, half: float) -> None:
+        """Make resting orders match `want`, without churning: an order is kept while it is within one tick of
+        the desired price AND still earns at least half the target edge. Anything else is cancelled and replaced,
+        so quotes follow fair value as it moves but a 1-cent wiggle doesn't burn the rate limit."""
         have = self.broker.open_orders()
         keep_ids, todo = set(), list(want)
         for o in have:
-            hit = next((q for q in todo if q.intent == o.intent and abs(q.price - o.price) < tick / 2
-                        and 0.5 * q.qty <= o.qty <= q.qty + 1e-9), None)
-            if hit:
-                todo.remove(hit)
-                keep_ids.add(o.id)
+            for q in todo:
+                if q.intent != o.intent or not (0.5 * q.qty <= o.qty <= q.qty + 1e-9):
+                    continue
+                edge = (fair - o.price) if o.intent in (BUY_LONG, SELL_SHORT) else (o.price - fair)
+                if abs(q.price - o.price) <= tick * 1.01 and edge >= 0.5 * half:
+                    todo.remove(q)
+                    keep_ids.add(o.id)
+                    break
         for o in have:
             if o.id not in keep_ids:
                 self.broker.cancel(o.id)
@@ -224,6 +235,11 @@ class HourlyMaker:
                     fresh = find_current(self.us, now)
                     if fresh and fresh.slug == m.slug and fresh.price_to_beat:
                         self.mkt = m = fresh
+                fault = getattr(self.broker, "fault", None)
+                if fault:
+                    log.critical("BROKER FAULT: %s", fault)
+                    self.stop.set()
+                    break
                 why = self._quoteable(now)
                 with self._lock:
                     if why:
@@ -241,7 +257,7 @@ class HourlyMaker:
                             half = self._half(now, spot, sigma, fair)
                             want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=self.broker.position(), cfg=self.cfg,
                                               min_qty=m.min_qty)
-                            self._reconcile(want, m.tick)
+                            self._reconcile(want, m.tick, fair, half)
                             self._quoted_fair, self._quoted_half = fair, half
                             if now - last_log > 5:
                                 log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | pos %+g (+=Up -=Down) | %s",

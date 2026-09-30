@@ -120,3 +120,116 @@ def test_mirrored_fair_values_give_mirrored_quotes_across_the_range():
         b = {x.intent: x for x in yes_quotes(fair=1 - f, half=0.02, tick=0.01, pos=0, cfg=CFG)}
         assert abs(a[BUY_LONG].price - (1 - b[BUY_SHORT].price)) < 1e-9, f
         assert abs(a[BUY_SHORT].price - (1 - b[BUY_LONG].price)) < 1e-9, f
+
+
+# ---- requoting follows fair value without churning -------------------------------------------
+class _FakeBroker:
+    def __init__(self, orders=()):
+        self.orders = list(orders)
+        self.placed, self.cancelled = [], []
+
+    def open_orders(self):
+        return list(self.orders)
+
+    def place(self, intent, price, qty):
+        self.placed.append((intent, price, qty))
+
+    def cancel(self, oid):
+        self.cancelled.append(oid)
+
+
+def _maker(orders):
+    from polymarket_mm.hourly_mm import HourlyMaker
+    m = object.__new__(HourlyMaker)
+    m.broker = _FakeBroker(orders)
+    return m
+
+
+def test_requote_when_fair_moves_enough():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("a", BUY_LONG, 0.48, 1.0)])
+    # fair jumps to 0.60 -> desired bid 0.58; resting 0.48 is far off -> replace
+    m._reconcile([DesiredQuote(BUY_LONG, 0.58, 1.0)], 0.01, fair=0.60, half=0.02)
+    assert m.broker.cancelled == ["a"] and m.broker.placed == [(BUY_LONG, 0.58, 1.0)]
+
+
+def test_no_churn_on_one_tick_wiggle_while_edge_is_intact():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("a", BUY_LONG, 0.48, 1.0)])
+    # desired moved up one tick (0.49) but resting 0.48 still has 2c of edge vs fair 0.50 -> keep
+    m._reconcile([DesiredQuote(BUY_LONG, 0.49, 1.0)], 0.01, fair=0.51, half=0.02)
+    assert m.broker.cancelled == [] and m.broker.placed == []
+
+
+def test_replaces_when_resting_order_has_lost_its_edge():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("a", BUY_LONG, 0.49, 1.0)])
+    # fair fell to 0.495: resting bid 0.49 has ~0.5c edge (< half of 2c) -> must move down, not sit there
+    m._reconcile([DesiredQuote(BUY_LONG, 0.48, 1.0)], 0.01, fair=0.495, half=0.02)
+    assert m.broker.cancelled == ["a"] and m.broker.placed == [(BUY_LONG, 0.48, 1.0)]
+
+
+def test_down_side_requotes_too():
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    m = _maker([RestingOrder("d", BUY_SHORT, 0.52, 1.0)])       # BID DOWN 0.48
+    m._reconcile([DesiredQuote(BUY_SHORT, 0.42, 1.0)], 0.01, fair=0.40, half=0.02)   # fair Up fell -> Down bid rises
+    assert m.broker.cancelled == ["d"] and m.broker.placed == [(BUY_SHORT, 0.42, 1.0)]
+
+
+def test_order_body_gtd_expiry_format():
+    from polymarket_mm.us_broker import order_body
+    b = order_body("s", BUY_LONG, 0.48, 1, expire_at=1790786400)
+    assert b["tif"] == "TIME_IN_FORCE_GOOD_TILL_DATE" and b["goodTillTime"].endswith("Z") and b["goodTillTime"].startswith("2026-")
+
+
+class _FakeRest:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, method, path, params=None, body=None, priority=False):
+        self.calls.append((method, path, body, priority))
+        if path == "/v1/orders":
+            return {"id": "X1"}
+        if path == "/v1/orders/open":
+            return {"orders": []}
+        if path == "/v1/portfolio/positions":
+            return {"positions": {}}
+        if path == "/v1/account/balances":
+            return {"balances": [{"buyingPower": 1.64}]}
+        return {}
+
+
+def test_live_cancel_sends_market_slug_and_skips_rate_limit_queue():
+    """Regression: the exchange returns 400 unless the cancel body carries marketSlug."""
+    from polymarket_mm.us_broker import LiveBroker
+    r = _FakeRest()
+    b = LiveBroker(r, "slug-1")
+    b.cancel("ABC")
+    assert r.calls[-1] == ("POST", "/v1/order/ABC/cancel", {"marketSlug": "slug-1"}, True)
+
+
+def test_live_broker_respects_buying_power_and_tracks_orders_locally():
+    from polymarket_mm.us_broker import LiveBroker
+    r = _FakeRest()
+    b = LiveBroker(r, "s")
+    b.open_orders()                                    # primes buying power = 1.64
+    assert b.place(BUY_LONG, 0.48, 1.0) == "X1"        # costs 0.48
+    assert b.place(BUY_SHORT, 0.30, 1.0) == "X1"       # costs 0.70 -> total 1.18 <= 1.64
+    assert b.place(BUY_LONG, 0.90, 1.0) is None        # 0.90 > remaining ~0.46: refused, no API call
+    assert sum(1 for c in r.calls if c[1] == "/v1/orders") == 2
+
+
+def test_broker_flags_fault_if_position_sign_contradicts_fills():
+    from polymarket_mm.us_broker import LiveBroker, RestingOrder
+    r = _FakeRest()
+    b = LiveBroker(r, "s")
+    b._orders = {"o1": RestingOrder("o1", BUY_LONG, 0.5, 1.0)}   # we bought 1 Up ...
+    orig = r.call
+    r.call = lambda m, p, params=None, body=None, priority=False: (
+        {"positions": {"s": {"netPositionDecimal": "-1"}}} if p == "/v1/portfolio/positions" else orig(m, p, params, body, priority))
+    b._refresh(force=True)                                        # ... order vanished, but position went to -1
+    assert b.fault and "sign" in b.fault

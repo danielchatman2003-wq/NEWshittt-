@@ -234,21 +234,32 @@ class LiveBroker:
         return [RestingOrder(o.id, o.intent, o.price, o.qty, self._placed_at.get(o.id, 0.0)) for o in self._orders.values()]
 
     def take(self, intent: str, price: float, qty: float) -> bool:
-        """Cross the spread to reduce inventory (IOC). Returns True if the request was accepted."""
+        """Cross the spread to reduce inventory (IOC). Whether it FILLED is decided by the position the exchange reports
+        afterwards, not by parsing the order response (live: a fill at 0.47 was logged as filled=0)."""
+        try:
+            self._refresh(force=True)
+        except Exception:
+            pass
+        before = self._pos
         try:
             resp = self.rest.call("POST", "/v1/orders", body=take_body(self.slug, intent, price, qty))
         except (UsApiError, requests.ConnectionError, requests.Timeout) as e:
             log.warning("TAKE %s %.2f x%g failed: %s", intent[13:], price, qty, str(e)[:120])
             self._last = float("-inf")
             return False
-        filled = sum(float(e.get("lastShares") or 0) for e in resp.get("executions", [])
-                     if str(e.get("type", "")).endswith(("FILL", "PARTIAL_FILL")))
-        log.info("[LIVE] TAKE  %-10s limit %.2f x%g  filled=%g  id=%s", intent[13:], price, qty, filled, resp.get("id"))
-        self._last = float("-inf")
-        if filled <= 1e-9:
-            return False                                   # do NOT pretend it filled
-        self._pending = (filled if intent in BUYS_YES else -filled, time.monotonic())
-        return True
+        sign = 1.0 if intent in BUYS_YES else -1.0
+        filled = 0.0
+        for _ in range(4):                                   # the position lags the order by a moment: look a few times
+            time.sleep(0.15)
+            try:
+                self._refresh(force=True)
+            except Exception:
+                continue
+            filled = (self._pos - before) * sign
+            if filled > 1e-9:
+                break
+        log.info("[LIVE] TAKE  %-10s limit %.2f x%g  filled=%g  id=%s", intent[13:], price, qty, max(filled, 0.0), resp.get("id"))
+        return filled > 1e-9
 
     def position(self) -> float:
         """Net YES contracts. Conservative: a just-vanished order counts as filled until the position confirms

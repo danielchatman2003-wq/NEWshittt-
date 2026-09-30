@@ -1,7 +1,7 @@
 import pytest
 
 from polymarket_mm.pairmaker15 import K, P, Leg, PairConfig, PairMaker, plan_entry
-from polymarket_mm.us_broker import BUY_LONG, BUY_SHORT, PaperBroker
+from polymarket_mm.us_broker import BUY_LONG, BUY_SHORT, SELL_LONG, PaperBroker
 from polymarket_mm.us_feed import UsBook
 
 CFG = PairConfig()
@@ -243,7 +243,18 @@ def test_live_take_only_counts_real_fills():
     assert kb.take(BUY_LONG, 0.5, 1.0) is False and kb._pending == (0.0, 0.0)          # IOC found nothing: not a fill
     kb = KalshiLiveBroker(R({"order_id": "x", "fill_count": "1.00"}), "T")
     assert kb.take(BUY_LONG, 0.5, 1.0) is True and kb._pending[0] == 1.0
-    pb = LiveBroker(R({"id": "x", "executions": [{"type": "EXECUTION_TYPE_NEW", "lastShares": "0"}]}), "s")
-    assert pb.take(BUY_SHORT, 0.5, 1.0) is False
-    pb = LiveBroker(R({"id": "x", "executions": [{"type": "EXECUTION_TYPE_FILL", "lastShares": "1"}]}), "s")
-    assert pb.take(BUY_SHORT, 0.5, 1.0) is True
+    # Polymarket: fill is judged by the position the exchange reports afterwards, not by the order response
+    class PmRest:
+        def __init__(self, positions): self.positions, self.n = positions, 0
+        def call(self, method, path, params=None, body=None, priority=False):
+            if path == "/v1/portfolio/positions":
+                v = self.positions[min(self.n, len(self.positions) - 1)]
+                self.n += 1
+                return {"positions": {"s": {"netPositionDecimal": str(v)}} if v else {}}
+            if path == "/v1/orders":
+                return {"id": "x", "executions": []}                # the response says nothing about fills (as seen live)
+            return {"orders": []} if path == "/v1/orders/open" else {"balances": [{"buyingPower": 5}]}
+    filled = LiveBroker(PmRest([1.0, 1.0, 0.0]), "s")               # long 1 -> sold it: position went to 0 => a fill
+    assert filled.take(SELL_LONG, 0.46, 1.0) is True
+    unfilled = LiveBroker(PmRest([1.0]), "s")                       # position never changes => not filled
+    assert unfilled.take(SELL_LONG, 0.46, 1.0) is False

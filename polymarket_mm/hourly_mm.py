@@ -49,6 +49,11 @@ class HourlyConfig:
     trend_cap: float = 0.05
     exit_slack: float = 0.02      # an exit may sell up to this far below fair (to join the book and actually fill)
     touch_tol: float = 0.02       # join the book's top on both sides if within this of fair (0 = model-edge quotes only)
+    exit_hold: float = 30.0       # an exit order rests at least this long before it may be moved DOWN/passive (it may still move
+                                  # up immediately if it would be selling too cheap). Chasing a falling market never fills.
+    exit_take_after: float = 60.0  # still holding after this long -> cross the spread (IOC) to get out
+    take_slack: float = 0.05      # ...but never take an exit more than this below fair value
+    take_retry: float = 10.0
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -113,6 +118,25 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     return out
 
 
+def exit_take(*, pos: float, fair: float, best_bid: float, best_ask: float, tick: float, cfg: HourlyConfig,
+              min_qty: float = 0.01):
+    """Cross-the-spread exit for stale inventory: returns (intent, worst_yes_price, qty) or None.
+    Up held:   SELL_LONG  IOC with limit best_bid - 1 tick.   Down held: SELL_SHORT IOC with limit best_ask + 1 tick
+    (prices are YES prices). Refused if it would give up more than take_slack versus fair value."""
+    if abs(pos) <= min_qty:
+        return None
+    t = _d(tick)
+    if pos > 0:
+        limit = _floor(_d(best_bid) - t, t)
+        if limit < t or float(limit) < fair - cfg.take_slack:
+            return None
+        return SELL_LONG, float(limit), min(cfg.size, pos)
+    limit = _ceil(_d(best_ask) + t, t)
+    if limit > 1 - t or float(limit) > fair + cfg.take_slack:
+        return None
+    return SELL_SHORT, float(limit), min(cfg.size, -pos)
+
+
 def extra_half(*, now: float, last_fill: float, fair_hist, fair: float, cfg: HourlyConfig) -> float:
     """Adverse-selection padding on top of the base half-spread: (a) +fill_widen for fill_widen_seconds after any
     fill, (b) the amount fair value moved over the last trend_window seconds (capped). Fast markets and fresh
@@ -146,6 +170,8 @@ class HourlyMaker:
         self._last_fill = 0.0
         self._prev_pos: float | None = None
         self._last_log = 0.0
+        self._inv_since: float | None = None   # when the current inventory was first seen
+        self._last_take = 0.0
         brti.on_tick = self._on_tick
 
     # -- model inputs -------------------------------------------------------
@@ -267,7 +293,10 @@ class HourlyMaker:
                 passive_by = (q.price - o.price) if bidlike else (o.price - q.price)   # >0: resting is more passive
                 is_exit = o.intent in (SELL_LONG, SELL_SHORT)
                 room = (cfg.exit_ticks if is_exit else 1) * tick   # exits hold their place in the queue
-                if -eps <= passive_by <= room + eps:
+                age = (time.monotonic() - o.placed_at) if o.placed_at else 1e9
+                young_exit = is_exit and age < cfg.exit_hold       # a young exit is NEVER moved passive/down (chasing a
+                                                                   # falling market means it never rests long enough to fill)
+                if passive_by >= -eps and (passive_by <= room + eps or young_exit):
                     todo.remove(q)
                     keep_ids.add(o.id)
                     break
@@ -319,10 +348,27 @@ class HourlyMaker:
             if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
                 self._last_fill = now  # position changed => we were just traded against
             self._prev_pos = pos
+            if abs(pos) > m.min_qty:
+                self._inv_since = self._inv_since or now
+            else:
+                self._inv_since = None
+            bk = self.book_feed.book(m.slug)
+            if (bk and self._inv_since and now - self._inv_since >= self.cfg.exit_take_after
+                    and now - self._last_take >= self.cfg.take_retry and bk.best_bid is not None and bk.best_ask is not None):
+                tk = exit_take(pos=pos, fair=fair, best_bid=bk.best_bid, best_ask=bk.best_ask, tick=m.tick, cfg=self.cfg,
+                               min_qty=m.min_qty)
+                self._last_take = now
+                if tk:
+                    log.warning("EXIT TAKE: held %+g for %.0fs without selling -> crossing the spread (%s limit %.2f)",
+                                pos, now - self._inv_since, tk[0][13:], tk[1])
+                    self.broker.cancel_all()          # free the position locked by our resting exit first
+                    self._quoted_fair = None
+                    self.broker.take(*tk)
+                    return
+                log.info("exit take skipped: bid too far below fair (model says hold)")
             pad = extra_half(now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
             half = self._half(now, spot, sigma, fair) + pad
             self._fair_hist.append((now, fair))
-            bk = self.book_feed.book(m.slug)
             want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
                               book=(bk.best_bid, bk.best_ask) if bk else None,
                               touch_tol=max(0.0, self.cfg.touch_tol - pad))

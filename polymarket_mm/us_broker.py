@@ -29,6 +29,7 @@ class RestingOrder:
     intent: str
     price: float
     qty: float
+    placed_at: float = 0.0  # time.monotonic() when WE placed it (0 = unknown/old): lets exits hold their place
 
 
 class UsApiError(Exception):
@@ -75,6 +76,21 @@ def order_body(slug: str, intent: str, price: float, qty: float, tick_decimals: 
         body["tif"] = "TIME_IN_FORCE_GOOD_TILL_DATE"
         body["goodTillTime"] = datetime.fromtimestamp(expire_at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return body
+
+
+def take_body(slug: str, intent: str, price: float, qty: float, tick_decimals: int = 2) -> dict:
+    """Immediate-or-cancel LIMIT order that is allowed to take liquidity (pays the taker fee). Used ONLY to get out of
+    inventory. `price` is the worst price we accept, so it cannot fill beyond it."""
+    return {
+        "marketSlug": slug,
+        "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": f"{price:.{tick_decimals}f}", "currency": "USD"},
+        "quantity": qty,
+        "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+        "intent": intent,
+        "participateDontInitiate": False,
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+    }
 
 
 class UsRest:
@@ -207,7 +223,21 @@ class LiveBroker:
 
     def open_orders(self) -> list[RestingOrder]:
         self._refresh()
-        return list(self._orders.values())
+        return [RestingOrder(o.id, o.intent, o.price, o.qty, self._placed_at.get(o.id, 0.0)) for o in self._orders.values()]
+
+    def take(self, intent: str, price: float, qty: float) -> bool:
+        """Cross the spread to reduce inventory (IOC). Returns True if the request was accepted."""
+        try:
+            resp = self.rest.call("POST", "/v1/orders", body=take_body(self.slug, intent, price, qty))
+        except (UsApiError, requests.ConnectionError, requests.Timeout) as e:
+            log.warning("TAKE %s %.2f x%g failed: %s", intent[13:], price, qty, str(e)[:120])
+            self._last = 0.0
+            return False
+        log.info("[LIVE] TAKE  %-10s limit %.2f x%g  id=%s", intent[13:], price, qty, resp.get("id"))
+        # assume it fills until the position says otherwise (conservative for the position cap)
+        self._pending = (qty if intent in BUYS_YES else -qty, time.monotonic())
+        self._last = 0.0
+        return True
 
     def position(self) -> float:
         """Net YES contracts. Conservative: a just-vanished order counts as filled until the position confirms
@@ -237,6 +267,15 @@ class PaperBroker:
             self._orders[oid] = RestingOrder(oid, intent, price, qty)
         log.info("[paper] PLACE %-9s %.2f x%g", _short(intent), price, qty)
         return oid
+
+    def take(self, intent: str, price: float, qty: float) -> bool:
+        with self._lock:
+            buys = intent in BUYS_YES
+            self.pos += qty if buys else -qty
+            self.cash += (-1 if buys else 1) * price * qty - 0.0695 * price * (1 - price) * qty
+            self.fills.append((intent, price, qty))
+        log.info("[paper] TAKE  %-9s %.2f x%g -> pos %+g", _short(intent), price, qty, self.pos)
+        return True
 
     def cancel(self, order_id: str) -> None:
         with self._lock:

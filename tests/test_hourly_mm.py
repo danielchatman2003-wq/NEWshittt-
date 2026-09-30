@@ -497,3 +497,51 @@ def test_touch_quotes_never_cross_the_book():
                 assert q[BUY_LONG].price < ba - 1e-9
             if BUY_SHORT in q:
                 assert q[BUY_SHORT].price > bb + 1e-9
+
+
+# ---- exits must actually exit: hold still, then cross ---------------------------------------------------------
+def test_exit_take_up_and_down_and_guards():
+    from polymarket_mm.hourly_mm import exit_take
+    cfg = HourlyConfig()
+    up = exit_take(pos=1.0, fair=0.30, best_bid=0.29, best_ask=0.30, tick=0.01, cfg=cfg)
+    assert up == (SELL_LONG, 0.28, 1.0)                              # limit = best bid - 1 tick, worst price we accept
+    dn = exit_take(pos=-1.0, fair=0.70, best_bid=0.29, best_ask=0.30, tick=0.01, cfg=cfg)
+    assert dn == (SELL_SHORT, 0.31, 1.0)                             # mirror, in YES-price space
+    assert exit_take(pos=0.0, fair=0.3, best_bid=0.29, best_ask=0.30, tick=0.01, cfg=cfg) is None
+    # book far below fair (book very bearish vs model): model says hold -> don't dump
+    assert exit_take(pos=1.0, fair=0.60, best_bid=0.29, best_ask=0.30, tick=0.01, cfg=cfg) is None
+    assert exit_take(pos=-1.0, fair=0.30, best_bid=0.70, best_ask=0.71, tick=0.01, cfg=cfg) is None
+
+
+def test_young_exit_is_not_chased_but_protects_itself_immediately():
+    import time as _t
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    now = _t.monotonic()
+    # fair fell 6 ticks: desired 0.35 but our young exit sits at 0.41 -> HOLD (do not chase down)
+    m = _maker([RestingOrder("e", SELL_LONG, 0.41, 1.0, placed_at=now - 5)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.35, 1.0)], 0.01, fair=0.36, half=0.02)
+    assert m.broker.cancelled == [] and m.broker.placed == []
+    # once it is old enough it may be re-priced
+    m = _maker([RestingOrder("e", SELL_LONG, 0.41, 1.0, placed_at=now - 40)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.35, 1.0)], 0.01, fair=0.36, half=0.02)
+    assert m.broker.cancelled == ["e"]
+    # fair ROSE: a young exit priced below desired is selling too cheap -> replace at once
+    m = _maker([RestingOrder("e", SELL_LONG, 0.41, 1.0, placed_at=now - 5)])
+    m._reconcile([DesiredQuote(SELL_LONG, 0.46, 1.0)], 0.01, fair=0.47, half=0.02)
+    assert m.broker.cancelled == ["e"]
+
+
+def test_paper_take_reduces_inventory_and_pays_the_taker_fee():
+    from polymarket_mm.us_broker import PaperBroker
+    b = PaperBroker()
+    b.pos, b.cash = 1.0, -0.39                                        # bought 1 Up at 0.39
+    b.take(SELL_LONG, 0.28, 1.0)
+    assert b.pos == 0.0
+    assert abs(b.cash - (-0.39 + 0.28 - 0.0695 * 0.28 * 0.72)) < 1e-9
+
+
+def test_take_body_is_ioc_and_allowed_to_take():
+    from polymarket_mm.us_broker import take_body
+    b = take_body("s", SELL_LONG, 0.28, 1)
+    assert b["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL" and b["participateDontInitiate"] is False and "goodTillTime" not in b

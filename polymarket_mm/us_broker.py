@@ -105,10 +105,14 @@ class LiveBroker:
     """Real orders. Reads (open orders, position, buying power) are cached ~1s and our own places/cancels
     update the cache immediately, so the 4Hz quoting loop costs ~3 requests/s, not 12."""
 
+    LIST_LAG_GRACE = 4.0  # seconds a new order may be missing from the exchange's list before we believe it's gone
+
     def __init__(self, rest: UsRest, slug: str, expire_at: float | None = None, refresh: float = 1.0):
         self.rest, self.slug, self.expire_at, self.refresh = rest, slug, expire_at, refresh
         self._orders: dict[str, RestingOrder] = {}
+        self._placed_at: dict[str, float] = {}  # order id -> monotonic time we placed it
         self._pos, self._bp = 0.0, None
+        self._pending = (0.0, 0.0)  # (assumed fill qty not yet in the position, when seen)
         self._last = 0.0
         self._warned = 0.0
         self.fault: str | None = None  # set if the exchange's position contradicts our fills (e.g. sign flipped)
@@ -128,12 +132,23 @@ class LiveBroker:
             self._bp = float(bj["balances"][0]["buyingPower"])
         except Exception:
             pass  # keep the last known value
-        gone = [o for i, o in self._orders.items() if i not in fresh]  # filled (or expired) since last look
+        # A just-placed order can take a moment to show up in the exchange's open-orders list. Dropping it here
+        # would make the bot think nothing is resting and place a DUPLICATE, so carry young orders forward.
+        now = time.monotonic()
+        for i, o in self._orders.items():
+            if i not in fresh and now - self._placed_at.get(i, 0.0) < self.LIST_LAG_GRACE:
+                fresh[i] = o
+        gone = [o for i, o in self._orders.items()
+                if i not in fresh and now - self._placed_at.get(i, 0.0) >= self.LIST_LAG_GRACE]  # filled/expired
         expected = sum(o.qty if o.intent in BUYS_YES else -o.qty for o in gone)
         delta = pos - self._pos
         if gone and abs(delta) > 1e-9 and expected * delta < 0:
             self.fault = (f"position moved {delta:+g} but the orders that vanished imply {expected:+g}: "
                           "position sign convention is not what we assumed - STOPPING")
+        if gone and abs(delta) < 1e-9 and expected:
+            self._pending = (expected, now)   # an order vanished but the position hasn't moved yet: assume it filled
+        elif abs(delta) > 1e-9:
+            self._pending = (0.0, 0.0)        # position caught up
         self._orders, self._pos, self._last = fresh, pos, time.monotonic()
 
     def _cost(self, intent: str, price: float, qty: float) -> float:
@@ -158,6 +173,7 @@ class LiveBroker:
         oid = resp.get("id")
         if oid:
             self._orders[oid] = RestingOrder(oid, intent, price, qty)
+            self._placed_at[oid] = time.monotonic()
             if self._bp is not None:
                 self._bp -= cost
             log.info("[LIVE] PLACE %-10s %.2f x%g  id=%s", intent[13:], price, qty, oid)
@@ -165,10 +181,12 @@ class LiveBroker:
 
     def cancel(self, order_id: str) -> None:
         self._orders.pop(order_id, None)
+        self._placed_at.pop(order_id, None)
         self.rest.call("POST", f"/v1/order/{order_id}/cancel", body={"marketSlug": self.slug}, priority=True)
 
     def cancel_all(self) -> None:
         self._orders.clear()
+        self._placed_at.clear()
         self.rest.call("POST", "/v1/orders/open/cancel", body={"slugs": [self.slug]}, priority=True)
         self._last = 0.0  # re-read truth next time
 
@@ -177,8 +195,11 @@ class LiveBroker:
         return list(self._orders.values())
 
     def position(self) -> float:
+        """Net YES contracts. Conservative: a just-vanished order counts as filled until the position confirms
+        (for ~5s), so the position cap can't be overshot by a laggy read."""
         self._refresh()
-        return self._pos
+        qty, t = self._pending
+        return self._pos + (qty if qty and time.monotonic() - t < 5.0 else 0.0)
 
 
 class PaperBroker:

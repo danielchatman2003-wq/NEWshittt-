@@ -233,3 +233,48 @@ def test_broker_flags_fault_if_position_sign_contradicts_fills():
         {"positions": {"s": {"netPositionDecimal": "-1"}}} if p == "/v1/portfolio/positions" else orig(m, p, params, body, priority))
     b._refresh(force=True)                                        # ... order vanished, but position went to -1
     assert b.fault and "sign" in b.fault
+
+
+def test_no_duplicate_orders_when_exchange_list_lags_behind_our_placement():
+    """Regression (seen live): a fresh order wasn't in /orders/open yet; the old code forgot it and re-placed it."""
+    from polymarket_mm.hourly_mm import DesiredQuote, HourlyMaker
+    from polymarket_mm.us_broker import LiveBroker
+
+    class LaggyRest(_FakeRest):          # exchange never lists anything (worst case lag)
+        n = 0
+
+        def call(self, method, path, params=None, body=None, priority=False):
+            if path == "/v1/orders":
+                LaggyRest.n += 1
+                return {"id": f"O{LaggyRest.n}"}
+            return super().call(method, path, params, body, priority)
+
+    b = LiveBroker(LaggyRest(), "s", refresh=0.0)        # refresh on every read: the failure case
+    m = object.__new__(HourlyMaker)
+    m.broker = b
+    want = [DesiredQuote(BUY_LONG, 0.44, 1.0), DesiredQuote(BUY_SHORT, 0.49, 1.0)]
+    for _ in range(6):                                   # six loop iterations in a row
+        m._reconcile(want, 0.01, fair=0.47, half=0.02)
+    assert LaggyRest.n == 2, f"placed {LaggyRest.n} orders for 2 desired quotes"
+
+
+def test_order_really_gone_after_grace_is_treated_as_filled():
+    from polymarket_mm.us_broker import LiveBroker, RestingOrder
+    r = _FakeRest()
+    b = LiveBroker(r, "s")
+    b._orders = {"o1": RestingOrder("o1", BUY_LONG, 0.5, 1.0)}
+    b._placed_at = {"o1": time.monotonic() - 10}         # old enough: absent from the list means it's gone
+    b._refresh(force=True)
+    assert "o1" not in b._orders
+
+
+def test_vanished_order_counts_as_filled_until_position_confirms():
+    from polymarket_mm.us_broker import LiveBroker, RestingOrder
+    r = _FakeRest()                                            # reports position 0 (lagging)
+    b = LiveBroker(r, "s")
+    b._orders = {"o1": RestingOrder("o1", BUY_LONG, 0.5, 1.0)}
+    b._placed_at = {"o1": time.monotonic() - 10}
+    b._refresh(force=True)                                     # order vanished, position still 0
+    assert b.position() == 1.0                                 # assume the fill: cap can't be overshot
+    b._pending = (1.0, time.monotonic() - 10)                  # 10s later with no confirmation: stop assuming
+    assert b.position() == 0.0

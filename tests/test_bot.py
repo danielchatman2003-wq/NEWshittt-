@@ -132,3 +132,23 @@ def test_btc_market_pulled_when_feed_stale():
     bot, b = btc_bot(FakeBrti(tick=None))
     bot.cycle()
     assert b.open_orders("0xbtc") == [] and len(b.open_orders("0xabc")) == 2
+
+
+def test_instant_pull_on_brti_tick_without_waiting_for_cycle():
+    bot, b = btc_bot(FakeBrti(move=0.0002))
+    bot.cycle()
+    assert len(b.open_orders("0xbtc")) == 2
+    bot.brti._move = 0.01
+    bot._on_brti_tick(None)  # what the feed thread calls on every tick
+    assert b.open_orders("0xbtc") == [] and len(b.open_orders("0xabc")) == 2
+
+
+def test_halt_blocks_requote_until_it_expires(monkeypatch):
+    bot, b = btc_bot(FakeBrti(move=0.01))
+    bot._on_brti_tick(None)
+    bot.brti._move = 0.0002          # calm again, but still inside the halt window
+    bot.cycle()
+    assert b.open_orders("0xbtc") == []
+    bot._halt_until = 0.0
+    bot.cycle()
+    assert len(b.open_orders("0xbtc")) == 2

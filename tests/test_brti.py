@@ -78,3 +78,25 @@ def test_move_over_window():
     for i, px in enumerate([100.0, 100.0, 101.0]):
         f._history.append((1000.0 + i * 20, px))  # 40s of data
     assert abs(f.move(30) - 0.01) < 1e-9
+
+
+def frame5(value="84099.71", **over):
+    m = {"type": "cfbenchmarks_value_5hz", "sid": 2, "seq": 1,
+         "msg": {"index_id": "BRTI", "value_usd": value, "source_ts_ms": 1, "received_at": 1_780_000_000_200,
+                 "data": json.dumps({"type": "value", "time": 1, "id": "BRTI", "value": value})}}
+    m["msg"].update(over)
+    return json.dumps(m)
+
+
+def test_parse_5hz():
+    t = parse_message(frame5())
+    assert t.fast and t.spot == 84099.71 and t.avg_60s is None
+
+
+def test_merge_keeps_5hz_spot_and_1hz_average():
+    f = BrtiFeed(KalshiAuth("k", pem(ed25519.Ed25519PrivateKey.generate())))
+    f._merge(parse_message(frame()))                       # 1Hz first: has the average
+    m = f._merge(parse_message(frame5("70000.5")))          # 5Hz: newer spot, average retained
+    assert m.spot == 70000.5 and m.avg_60s == 67100.12345678 and m.fast
+    m = f._merge(parse_message(frame()))                    # late 1Hz must not overwrite the fresher 5Hz spot
+    assert m.spot == 70000.5 and m.avg_60s == 67100.12345678

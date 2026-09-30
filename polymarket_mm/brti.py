@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import websockets
@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 log = logging.getLogger(__name__)
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 WS_PATH = "/trade-api/ws/v2"
+CHANNELS = ["cfbenchmarks_value", "cfbenchmarks_value_5hz"]  # 1Hz (+60s avg) and 5Hz (spot)
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class BrtiTick:
     quarter_hour_avg: float | None  # only present in the final minute before :00/:15/:30/:45
     received_at: float  # upstream receipt time, unix seconds
     local_ts: float  # when we got it, time.time()
+    fast: bool = False  # True if this print came from the 5Hz channel
 
 
 class KalshiAuth:
@@ -86,8 +88,10 @@ def parse_message(raw: str | bytes, index_id: str = "BRTI") -> BrtiTick | None:
         m = json.loads(raw)
     except ValueError:
         return None
-    if m.get("type") != "cfbenchmarks_value":
+    kind = m.get("type")
+    if kind not in CHANNELS:
         return None
+    fast = kind == "cfbenchmarks_value_5hz"
     msg = m.get("msg") or {}
     if msg.get("index_id") != index_id:
         return None
@@ -107,12 +111,13 @@ def parse_message(raw: str | bytes, index_id: str = "BRTI") -> BrtiTick | None:
     avg = find("avg_60s_data") or {}
     qh = find("last_60s_windowed_average_15min") or {}
     return BrtiTick(
-        spot=_f(frame.get("value")),
+        spot=_f(msg.get("value_usd")) or _f(frame.get("value")),
         avg_60s=_f(avg.get("value")),
         avg_60s_ticks=int(avg.get("window_size") or 0),
         quarter_hour_avg=_f(qh.get("value")),
         received_at=(_f(msg.get("received_at")) or time.time() * 1000) / 1000,
         local_ts=time.time(),
+        fast=fast,
     )
 
 
@@ -124,6 +129,7 @@ class BrtiFeed:
         self._tick: BrtiTick | None = None
         self._history: deque[tuple[float, float]] = deque(maxlen=600)  # (local_ts, price)
         self._lock = threading.Lock()
+        self._last_fast = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.on_tick = None  # optional callback(BrtiTick), runs on the feed thread
@@ -148,6 +154,21 @@ class BrtiFeed:
             return None
         return abs(now_px - old[0]) / old[0]
 
+    def _merge(self, tick: BrtiTick) -> BrtiTick:
+        """Combine the two channels: 5Hz owns `spot`, 1Hz owns the 60s averages."""
+        with self._lock:
+            prev = self._tick
+            if tick.fast:
+                self._last_fast = tick.local_ts
+                merged = replace(prev, spot=tick.spot, received_at=tick.received_at, local_ts=tick.local_ts, fast=True) if prev else tick
+            else:
+                fresh_fast = prev is not None and tick.local_ts - self._last_fast < 1.5
+                merged = replace(tick, spot=prev.spot, fast=True) if fresh_fast else tick
+                if fresh_fast:  # keep the 5Hz timestamps, take the averages
+                    merged = replace(merged, received_at=prev.received_at, local_ts=prev.local_ts)
+            self._tick = merged
+            return merged
+
     def start(self) -> None:
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True, name="brti-feed")
         self._thread.start()
@@ -170,7 +191,7 @@ class BrtiFeed:
         async with websockets.connect(self.url, additional_headers=self.auth.headers(), ping_interval=10) as ws:
             await ws.send(json.dumps({
                 "id": 1, "cmd": "subscribe",
-                "params": {"channels": ["cfbenchmarks_value"], "index_ids": [self.index_id]},
+                "params": {"channels": CHANNELS, "index_ids": [self.index_id]},
             }))
             log.info("BRTI feed connected")
             while not self._stop.is_set():
@@ -182,10 +203,12 @@ class BrtiFeed:
                 if tick is None:
                     log.debug("non-tick frame: %.200s", raw)
                     continue
-                px = tick.spot if tick.spot is not None else tick.avg_60s
-                with self._lock:
-                    self._tick = tick
-                    if px:
-                        self._history.append((tick.local_ts, px))
+                tick = self._merge(tick)
+                if tick.spot:
+                    with self._lock:
+                        self._history.append((tick.local_ts, tick.spot))
                 if self.on_tick:
-                    self.on_tick(tick)
+                    try:
+                        self.on_tick(tick)
+                    except Exception:
+                        log.exception("on_tick callback failed")

@@ -11,6 +11,7 @@ from .quoter import Quote, compute_quotes
 log = logging.getLogger(__name__)
 RESELECT_SECONDS = 1800
 REWARD_SPREAD_MARGIN = 0.9  # stay comfortably inside the rewards spread
+SPIKE_HALT_SECONDS = 5.0  # after an instant pull, don't re-quote BTC markets for this long
 BTC_RE = re.compile(r"\b(bitcoin|btc)\b", re.I)
 
 
@@ -28,9 +29,37 @@ class MarketMaker:
         self.stop = threading.Event()
         self._prev_mid: dict[str, float] = {}
         self._errors = 0
+        self._order_lock = threading.Lock()  # serialises place/cancel between main loop and BRTI thread
+        self._halt_until = 0.0
+        if brti is not None:
+            brti.on_tick = self._on_brti_tick
 
     # -- one market ---------------------------------------------------------
+    def _on_brti_tick(self, tick) -> None:
+        """Runs on the BRTI thread for every tick: pull BTC quotes the instant BRTI spikes."""
+        now = time.monotonic()
+        if now < self._halt_until:
+            return
+        mv = self.brti.move(self.cfg.btc_window)
+        if mv is None or mv <= self.cfg.btc_move_pause:
+            return
+        with self._order_lock:
+            self._halt_until = now + SPIKE_HALT_SECONDS
+            for m in self.markets:
+                if BTC_RE.search(m.question):
+                    log.warning("BRTI moved %.3f%% in %.0fs -> INSTANT pull: %s", mv * 100, self.cfg.btc_window, m.question[:50])
+                    try:
+                        self.broker.cancel_market(m.condition_id)
+                    except Exception:
+                        log.exception("instant pull failed for %s", m.question[:50])
+
     def _place(self, q: Quote, m: Market) -> None:
+        with self._order_lock:
+            if self.brti is not None and BTC_RE.search(m.question) and time.monotonic() < self._halt_until:
+                return  # halted by a BRTI spike between deciding and placing
+            self._place_locked(q, m)
+
+    def _place_locked(self, q: Quote, m: Market) -> None:
         if isinstance(self.broker, DryRunBroker):
             self.broker.place(q, m.condition_id)
         else:
@@ -49,6 +78,8 @@ class MarketMaker:
         """Reason to pull quotes on a BTC market based on the BRTI feed, else None."""
         if self.brti is None or not BTC_RE.search(m.question):
             return None
+        if time.monotonic() < self._halt_until:
+            return "BRTI spike halt"
         if self.brti.latest() is None:
             return "BRTI feed stale/unavailable"
         mv = self.brti.move(self.cfg.btc_window)

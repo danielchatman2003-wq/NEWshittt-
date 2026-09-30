@@ -77,6 +77,46 @@ def main():
             lo, hi = np.percentile(bs, [2.5, 97.5])
             print(f"{theta:>6.2f} {margin:>7.2f} {len(a):>7d} {np.mean(a + np.array(costs) > 0.5) * 100:5.0f}% {np.mean(costs):>9.3f} {a.mean() * 100:>+11.2f}c   [{lo * 100:+.2f}, {hi * 100:+.2f}]c  {a.min() * 100:+6.1f}c {int((a < 0).sum()):>5d}")
     print("\n(each losing trade costs ~the price paid, so ONE reversal erases that many small wins)")
+    stop_test(cands)
+
+
+def stop_test(cands):
+    """What if we SELL when the model stops being sure? Exit at the market's bid (1 - the other side's ask) + taker fee."""
+    rng = np.random.default_rng(11)
+    print("\n== EXIT RULE: sell the moment the model's probability for our side falls to the stop level ==")
+    print(f"{'theta':>6} {'stop':>6} {'trades':>7} {'exited':>7} {'win%':>6} {'net/contract':>13}   95% CI           worst    losers")
+    for theta in (0.90, 0.95, 0.99):
+        for stop in (None, 0.85, 0.75, 0.60):
+            pnl, nexit = [], 0
+            for up_out, rows in cands:
+                for i, (tau, fair, ua, da) in enumerate(rows):
+                    if fair >= theta and ua <= 0.995 and fair - ua >= 0.02:
+                        side, px = "U", ua
+                    elif fair <= 1 - theta and da <= 0.995 and (1 - fair) - da >= 0.02:
+                        side, px = "D", da
+                    else:
+                        continue
+                    entry_fee = FEE * px * (1 - px)
+                    result = None
+                    if stop is not None:
+                        for tau2, f2, ua2, da2 in rows[i + 1:]:
+                            mine = f2 if side == "U" else 1 - f2
+                            if mine <= stop:                                   # the model no longer trusts it: sell into the bid
+                                bid = (1 - da2) if side == "U" else (1 - ua2)
+                                result = bid - px - entry_fee - FEE * bid * (1 - bid)
+                                nexit += 1
+                                break
+                    if result is None:
+                        won = (up_out == 1) if side == "U" else (up_out == 0)
+                        result = float(won) - px - entry_fee
+                    pnl.append(result)
+                    break
+            if len(pnl) < 8:
+                continue
+            a = np.array(pnl)
+            bs = [a[rng.integers(0, len(a), len(a))].mean() for _ in range(2000)]
+            lo, hi = np.percentile(bs, [2.5, 97.5])
+            print(f"{theta:>6.2f} {('none' if stop is None else f'{stop:.2f}'):>6} {len(a):>7d} {nexit:>7d} {np.mean(a > 0) * 100:5.0f}% {a.mean() * 100:>+11.2f}c   [{lo * 100:+.2f}, {hi * 100:+.2f}]c {a.min() * 100:+7.1f}c {int((a < 0).sum()):>7d}")
 
 
 if __name__ == "__main__":

@@ -696,3 +696,58 @@ def test_private_feed_calls_back_on_order_frames_and_ignores_heartbeats():
     f.stop()
     assert subs == ["SUBSCRIPTION_TYPE_ORDER", "SUBSCRIPTION_TYPE_POSITION"]
     assert len(got) == 1 and "orderSubscriptionUpdate" in got[0]        # the heartbeat did not ring the doorbell
+
+
+# ---- dead-man switch: quotes expire by themselves and are refreshed while alive ----------------------------------------
+def test_live_orders_carry_a_short_expiry_even_when_the_window_cutoff_is_far_away():
+    import time as _t
+    from polymarket_mm.us_broker import LiveBroker
+
+    class R(_FakeRest):
+        def call(self, method, path, params=None, body=None, priority=False):
+            if path == "/v1/orders":
+                self.body = body
+            return super().call(method, path, params, body, priority)
+
+    r = R()
+    b = LiveBroker(r, "s", expire_at=_t.time() + 3000, ttl=30)
+    b.place(BUY_LONG, 0.48, 1.0)
+    from datetime import datetime, timezone
+    exp = datetime.strptime(r.body["goodTillTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    assert 20 <= exp - _t.time() <= 32                      # ~30s, not ~50 minutes
+    assert r.body["tif"] == "TIME_IN_FORCE_GOOD_TILL_DATE"
+
+
+def test_window_cutoff_still_wins_when_it_is_sooner_than_the_ttl():
+    import time as _t
+    from datetime import datetime, timezone
+    from polymarket_mm.us_broker import LiveBroker
+
+    class R(_FakeRest):
+        def call(self, method, path, params=None, body=None, priority=False):
+            if path == "/v1/orders":
+                self.body = body
+            return super().call(method, path, params, body, priority)
+
+    r = R()
+    LiveBroker(r, "s", expire_at=_t.time() + 10, ttl=30).place(BUY_LONG, 0.48, 1.0)
+    exp = datetime.strptime(r.body["goodTillTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    assert exp - _t.time() <= 11
+
+
+def test_stale_orders_are_reposted_so_their_expiry_moves_out_but_fresh_ones_are_kept():
+    import time as _t
+    from polymarket_mm.hourly_mm import DesiredQuote
+    from polymarket_mm.us_broker import RestingOrder
+    now = _t.monotonic()
+    m = _maker([RestingOrder("a", BUY_LONG, 0.48, 1.0, placed_at=now - 3)])            # fresh: keep
+    m._reconcile([DesiredQuote(BUY_LONG, 0.48, 1.0)], 0.01, fair=0.5, half=0.02)
+    assert m.broker.cancelled == [] and m.broker.placed == []
+    m = _maker([RestingOrder("a", BUY_LONG, 0.48, 1.0, placed_at=now - 20)])           # 20s old (> refresh_age): re-post same price
+    m._reconcile([DesiredQuote(BUY_LONG, 0.48, 1.0)], 0.01, fair=0.5, half=0.02)
+    assert m.broker.cancelled == ["a"] and m.broker.placed == [(BUY_LONG, 0.48, 1.0)]
+
+
+def test_ttl_is_shorter_than_twice_the_refresh_age_so_a_live_bot_never_loses_its_quotes():
+    cfg = HourlyConfig()
+    assert cfg.refresh_age < cfg.order_ttl and cfg.order_ttl - cfg.refresh_age >= 10     # >=10s of slack to re-post before expiry

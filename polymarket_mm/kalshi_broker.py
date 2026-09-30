@@ -78,7 +78,7 @@ class KalshiLiveBroker:
         self.rest, self.ticker, self.expire_at, self.refresh = rest, ticker, expire_at, refresh
         self._orders: dict[str, RestingOrder] = {}
         self._placed_at: dict[str, float] = {}
-        self._pos, self._last, self._bp = 0.0, 0.0, None
+        self._pos, self._last, self._bp = 0.0, float("-inf"), None
         self._pending = (0.0, 0.0)
         self.fault: str | None = None
 
@@ -125,7 +125,7 @@ class KalshiLiveBroker:
             return None
         except (requests.ConnectionError, requests.Timeout) as e:
             log.warning("[Kalshi] place network error (%s): re-checking open orders", type(e).__name__)
-            self._last = 0.0
+            self._last = float("-inf")
             return None
         oid = resp.get("order_id")
         if oid:
@@ -141,11 +141,11 @@ class KalshiLiveBroker:
             resp = self.rest.call("POST", "/portfolio/events/orders", body=order_body(self.ticker, intent, price, qty, take=True))
         except (KalshiApiError, requests.ConnectionError, requests.Timeout) as e:
             log.warning("[Kalshi] TAKE %s %.4f failed: %s", intent[13:], price, str(e)[:120])
-            self._last = 0.0
+            self._last = float("-inf")
             return False
         filled = float(resp.get("fill_count") or 0)
         log.info("[Kalshi LIVE] TAKE  %-10s limit %.4f x%g  filled=%g", intent[13:], price, qty, filled)
-        self._last = 0.0
+        self._last = float("-inf")
         if filled <= 1e-9:
             return False                                   # IOC found nothing at our limit: do NOT pretend it filled
         self._pending = (filled if intent in BUYS_YES else -filled, time.monotonic())
@@ -157,7 +157,7 @@ class KalshiLiveBroker:
         self.rest.call("DELETE", f"/portfolio/events/orders/{order_id}", params={"market_ticker": self.ticker}, priority=True)
 
     def cancel_all(self) -> None:
-        self._last = 0.0
+        self._last = float("-inf")
         self._refresh(force=True)
         for oid in list(self._orders):
             try:
@@ -166,7 +166,7 @@ class KalshiLiveBroker:
                 log.warning("[Kalshi] cancel %s failed: %s", oid[:8], e)
         self._orders.clear()
         self._placed_at.clear()
-        self._last = 0.0
+        self._last = float("-inf")
 
     def open_orders(self) -> list[RestingOrder]:
         self._refresh()

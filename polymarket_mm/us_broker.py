@@ -133,20 +133,20 @@ class LiveBroker:
 
     LIST_LAG_GRACE = 4.0  # seconds a new order may be missing from the exchange's list before we believe it's gone
 
-    def __init__(self, rest: UsRest, slug: str, expire_at: float | None = None, refresh: float = 1.0):
-        self.rest, self.slug, self.expire_at, self.refresh = rest, slug, expire_at, refresh
+    def __init__(self, rest: UsRest, slug: str, expire_at: float | None = None, refresh: float = 1.0, ttl: float | None = None):
+        self.rest, self.slug, self.expire_at, self.refresh, self.ttl = rest, slug, expire_at, refresh, ttl
         self._orders: dict[str, RestingOrder] = {}
         self._placed_at: dict[str, float] = {}  # order id -> monotonic time we placed it
         self._pos, self._bp = 0.0, None
         self._pending = (0.0, 0.0)  # (assumed fill qty not yet in the position, when seen)
-        self._last = 0.0
+        self._last = float("-inf")      # 'never refreshed' (monotonic() counts from boot, so 0.0 would look recent)
         self._warned = 0.0
         self.fault: str | None = None  # set if the exchange's position contradicts our fills (e.g. sign flipped)
 
     def poke(self) -> None:
         """A push (private websocket) says something changed: make the next read go to REST now instead of waiting for
         the ~1s timer. REST is still the source of truth; this only removes the polling delay."""
-        self._last = 0.0
+        self._last = float("-inf")
 
     def _refresh(self, force: bool = False) -> None:
         if not force and time.monotonic() - self._last < self.refresh:
@@ -197,14 +197,17 @@ class LiveBroker:
                 self._warned = time.monotonic()
             return None
         try:
-            resp = self.rest.call("POST", "/v1/orders", body=order_body(self.slug, intent, price, qty, expire_at=self.expire_at))
+            exp = self.expire_at
+            if self.ttl:                                   # dead-man switch: expire soon unless we keep refreshing it
+                exp = min(exp, time.time() + self.ttl) if exp is not None else time.time() + self.ttl
+            resp = self.rest.call("POST", "/v1/orders", body=order_body(self.slug, intent, price, qty, expire_at=exp))
         except UsApiError as e:  # a rejected maker-only quote (would cross) must not kill the loop
             log.warning("place %s %.2f x%s rejected: %s", intent[13:], price, qty, e)
             return None
         except (requests.ConnectionError, requests.Timeout) as e:
             # unknown whether it landed: don't assume either way, re-read the exchange's list next time
             log.warning("place %s %.2f x%s: network error, will re-check open orders (%s)", intent[13:], price, qty, type(e).__name__)
-            self._last = 0.0
+            self._last = float("-inf")
             return None
         oid = resp.get("id")
         if oid:
@@ -224,7 +227,7 @@ class LiveBroker:
         self._orders.clear()
         self._placed_at.clear()
         self.rest.call("POST", "/v1/orders/open/cancel", body={"slugs": [self.slug]}, priority=True)
-        self._last = 0.0  # re-read truth next time
+        self._last = float("-inf")  # re-read truth next time
 
     def open_orders(self) -> list[RestingOrder]:
         self._refresh()
@@ -236,12 +239,12 @@ class LiveBroker:
             resp = self.rest.call("POST", "/v1/orders", body=take_body(self.slug, intent, price, qty))
         except (UsApiError, requests.ConnectionError, requests.Timeout) as e:
             log.warning("TAKE %s %.2f x%g failed: %s", intent[13:], price, qty, str(e)[:120])
-            self._last = 0.0
+            self._last = float("-inf")
             return False
         filled = sum(float(e.get("lastShares") or 0) for e in resp.get("executions", [])
                      if str(e.get("type", "")).endswith(("FILL", "PARTIAL_FILL")))
         log.info("[LIVE] TAKE  %-10s limit %.2f x%g  filled=%g  id=%s", intent[13:], price, qty, filled, resp.get("id"))
-        self._last = 0.0
+        self._last = float("-inf")
         if filled <= 1e-9:
             return False                                   # do NOT pretend it filled
         self._pending = (filled if intent in BUYS_YES else -filled, time.monotonic())

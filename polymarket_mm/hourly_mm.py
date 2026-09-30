@@ -71,6 +71,8 @@ class HourlyConfig:
     markout_widen: float = 0.015   # EWMA markout worse than -1.5c => widen quotes by 1c
     markout_pause: float = 0.03    # worse than -3c (over >=4 fills) => stop entering for markout_pause_secs
     markout_pause_secs: float = 60.0
+    order_ttl: float = 30.0        # DEAD-MAN SWITCH: every order expires on the exchange this many seconds after placement ...
+    refresh_age: float = 15.0      # ... and is re-posted once it is this old while the bot is alive. A dead bot leaves nothing behind.
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -349,7 +351,7 @@ class HourlyMaker:
             self.priv_feed = UsPrivateFeed(self.us, [nxt.slug])          # push: our own order/position updates
             self.priv_feed.on_event = lambda _j: self.broker.poke() if hasattr(self.broker, "poke") else None
             self.priv_feed.start()
-            self.broker = LiveBroker(self.rest, nxt.slug, expire_at=nxt.window_end - self.cfg.stop_before_end)
+            self.broker = LiveBroker(self.rest, nxt.slug, expire_at=nxt.window_end - self.cfg.stop_before_end, ttl=self.cfg.order_ttl)
             self.broker.cancel_all()  # start clean: nothing of ours resting from a previous run
             log.warning("LIVE on %s: position %+g, buying power $%s", nxt.slug, self.broker.position(), self.broker._bp)
         else:
@@ -393,6 +395,8 @@ class HourlyMaker:
                 is_exit = o.intent in (SELL_LONG, SELL_SHORT)
                 room = (cfg.exit_ticks if is_exit else 1) * tick   # exits hold their place in the queue
                 age = (time.monotonic() - o.placed_at) if o.placed_at else 1e9
+                if o.placed_at and time.monotonic() - o.placed_at >= cfg.refresh_age:
+                    continue                                       # we placed it and it is getting old: re-post to push its expiry out
                 young_exit = is_exit and age < cfg.exit_hold       # a young exit is NEVER moved passive/down (chasing a
                                                                    # falling market means it never rests long enough to fill)
                 if passive_by >= -eps and (passive_by <= room + eps or young_exit):

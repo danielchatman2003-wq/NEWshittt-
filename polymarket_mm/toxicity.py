@@ -94,7 +94,9 @@ class PressureModel:
         self._t = now
         self._warm += 1
         di, ds = max(-1.0, min(1.0, i - self._bi)), max(-1.0, min(1.0, s - self._bs))
-        return (di + ds + flow_imbalance) / 3.0
+        # executed trades are real; displayed size can be a bluff (a wall that is pulled the moment it is tested), so flow
+        # carries half the weight and the two book-size signals share the other half
+        return 0.25 * di + 0.25 * ds + 0.5 * flow_imbalance
 
 
 class ToxicityGate:

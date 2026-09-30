@@ -57,7 +57,7 @@ def make_maker():
     m = object.__new__(PairMaker)
     m.cfg = CFG
     m.brokers = {K: PaperBroker(maker_rebate=-0.0175, taker_fee=0.07), P: PaperBroker()}
-    m._plan_legs, m._completed = {}, False
+    m._plan_legs, m._hedge_tries = {}, 0
     return m
 
 
@@ -179,7 +179,7 @@ def maker_with_legs(held_venue, held_intent, held_yes_price, partner_qty=1.0):
     m = make_maker()
     m.cfg = PairConfig()
     other = P if held_venue == K else K
-    m._completed = False
+    m._hedge_tries = 0
     m._plan_legs = {held_venue: Leg(held_venue, held_intent, held_yes_price, 1.0),
                     other: Leg(other, BUY_SHORT if held_intent == BUY_LONG else BUY_LONG, 0.5, partner_qty)}
     return m, other
@@ -214,4 +214,36 @@ def test_completion_is_attempted_once_and_partner_size_is_respected():
     m.brokers[K].pos = 2.0                                              # a LOADED leg (2 Up)
     assert m._try_complete({K: 2.0, P: 0.0}, book(0.40, 0.41), book(0.60, 0.61))
     assert m.brokers[P].pos == -1.0                                     # hedges the partner size only: net +1 Up stays (the lean)
-    assert not m._try_complete({K: 2.0, P: -1.0}, book(0.40, 0.41), book(0.60, 0.61))   # second call: already done
+    m._hedge_tries = 3
+    assert not m._try_complete({K: 2.0, P: -1.0}, book(0.40, 0.41), book(0.60, 0.61))   # out of tries
+
+
+
+def test_hedge_limit_is_the_cost_cap_and_unfilled_hedge_is_not_treated_as_done():
+    m, other = maker_with_legs(K, BUY_LONG, 0.40)
+    m.brokers[K].pos = 1.0
+    taken = []
+    m.brokers[P].take = lambda intent, px, qty: taken.append((intent, px, qty)) or False      # exchange fills nothing
+    pb = book(0.61, 0.62)                                   # Down costs 0.39: combined 0.79, well inside the cap
+    assert not m._try_complete({K: 1.0, P: 0.0}, book(0.40, 0.41), pb)        # False: nothing actually filled
+    assert taken and abs(taken[0][1] - (1 - (1.03 - 0.40))) < 1e-9            # limit = the price that makes the pair cost exactly 1.03
+    assert m._hedge_tries == 1
+    assert not m._try_complete({K: 1.0, P: 0.0}, book(0.40, 0.41), pb) and m._hedge_tries == 2   # it retries
+
+
+def test_live_take_only_counts_real_fills():
+    from polymarket_mm.kalshi_broker import KalshiLiveBroker
+    from polymarket_mm.us_broker import LiveBroker
+
+    class R:
+        def __init__(self, resp): self.resp = resp
+        def call(self, *a, **k): return self.resp
+
+    kb = KalshiLiveBroker(R({"order_id": "x", "fill_count": "0.00"}), "T")
+    assert kb.take(BUY_LONG, 0.5, 1.0) is False and kb._pending == (0.0, 0.0)          # IOC found nothing: not a fill
+    kb = KalshiLiveBroker(R({"order_id": "x", "fill_count": "1.00"}), "T")
+    assert kb.take(BUY_LONG, 0.5, 1.0) is True and kb._pending[0] == 1.0
+    pb = LiveBroker(R({"id": "x", "executions": [{"type": "EXECUTION_TYPE_NEW", "lastShares": "0"}]}), "s")
+    assert pb.take(BUY_SHORT, 0.5, 1.0) is False
+    pb = LiveBroker(R({"id": "x", "executions": [{"type": "EXECUTION_TYPE_FILL", "lastShares": "1"}]}), "s")
+    assert pb.take(BUY_SHORT, 0.5, 1.0) is True

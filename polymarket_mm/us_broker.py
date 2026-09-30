@@ -233,10 +233,13 @@ class LiveBroker:
             log.warning("TAKE %s %.2f x%g failed: %s", intent[13:], price, qty, str(e)[:120])
             self._last = 0.0
             return False
-        log.info("[LIVE] TAKE  %-10s limit %.2f x%g  id=%s", intent[13:], price, qty, resp.get("id"))
-        # assume it fills until the position says otherwise (conservative for the position cap)
-        self._pending = (qty if intent in BUYS_YES else -qty, time.monotonic())
+        filled = sum(float(e.get("lastShares") or 0) for e in resp.get("executions", [])
+                     if str(e.get("type", "")).endswith(("FILL", "PARTIAL_FILL")))
+        log.info("[LIVE] TAKE  %-10s limit %.2f x%g  filled=%g  id=%s", intent[13:], price, qty, filled, resp.get("id"))
         self._last = 0.0
+        if filled <= 1e-9:
+            return False                                   # do NOT pretend it filled
+        self._pending = (filled if intent in BUYS_YES else -filled, time.monotonic())
         return True
 
     def position(self) -> float:

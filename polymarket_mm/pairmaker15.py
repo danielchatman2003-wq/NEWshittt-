@@ -144,7 +144,7 @@ class PairMaker:
         self._equity0: float | None = None
         self.first_fill: float | None = None
         self._plan_legs: dict = {}      # venue -> the Leg most recently rested there
-        self._completed = False         # already tried to complete the pair for this lone leg
+        self._hedge_tries = 0           # attempts to complete the pair for this lone leg
         self.window_done = False   # one attempt per window: after a lone-leg exit we stand down until the next window
         self.total_pnl, self.windows, self.stats = 0.0, 0, {"pairs": 0, "legged": 0, "no_fill": 0}
         self._last_log = 0.0
@@ -201,7 +201,7 @@ class PairMaker:
             self.brokers, self._k_ticker = {}, None      # fresh live brokers per window (per-market tickers/slugs)
         self.first_fill = None
         self.window_done = False
-        self._completed = False
+        self._hedge_tries = 0
         self._plan_legs = {}
         log.info("=== window %s (ref %s) ===", nxt.slug[-16:], nxt.price_to_beat)
         return True
@@ -284,8 +284,8 @@ class PairMaker:
             self._sync_orders(plan)
             if now - self._last_log > 10:
                 side = "--" if edge is None else ("UP" if edge >= c.lean_edge else "DOWN" if edge <= -c.lean_edge else "neutral")
-                log.info("T-%4.0fs fair %.3f (model-vs-books %s%.1fc => %s) | K %s/%s  P %s/%s | %s", m.window_end - now, fair,
-                         "" if edge is None else "%+.1f" % (edge * 100), "", side, _f(kb.best_bid), _f(kb.best_ask),
+                log.info("T-%4.0fs fair %.3f (model-vs-books %s => %s) | K %s/%s  P %s/%s | %s", m.window_end - now, fair,
+                         "--" if edge is None else "%+.1fc" % (edge * 100), side, _f(kb.best_bid), _f(kb.best_ask),
                          _f(pb.best_bid), _f(pb.best_ask),
                          f"PAIR {plan[1]} margin {plan[0] * 100:.1f}c sizes {plan[2].qty:g}/{plan[3].qty:g} cost ${pair_cost(plan[2], plan[3]):.2f}" if plan else "no pair (margin/zone)")
                 self._last_log = now
@@ -330,10 +330,10 @@ class PairMaker:
                 broker.place(leg.intent, leg.price, leg.qty)
 
     def _try_complete(self, net, kb, pb) -> bool:
-        """One leg filled: buy the OTHER side right now (IOC taker on the other venue) if the pair still costs
-        <= hedge_max_cost. Both legs then pay exactly $1 whatever happens, so the result is locked (near break-even)
-        instead of an open directional leg. Returns True if the hedge order was sent."""
-        if self._completed:
+        """One leg filled: buy the OTHER side now (IOC taker on the other venue) while the pair can still cost <=
+        hedge_max_cost. The order's limit price IS that bound (so it can never pay more, and has the best chance to fill).
+        Only a real fill counts; up to 3 tries. Returns True only if the hedge actually filled."""
+        if self._hedge_tries >= 3:
             return False
         held = next((v for v, q in net.items() if abs(q) > 1e-9), None)
         if held is None:
@@ -343,22 +343,22 @@ class PairMaker:
         book = pb if other == P else kb
         if not entry or not partner:
             return False
+        cap = self.cfg.hedge_max_cost - entry.side_price          # the most we may pay for the other side
         tick = 0.01
-        if net[held] > 0:                              # holding Up -> buy Down on the other venue (= sell YES at its bid)
-            if book.best_bid is None:
+        if net[held] > 0:                              # holding Up -> buy Down on the other venue (= sell YES)
+            if book.best_bid is None or (1 - book.best_bid) > cap + 1e-9:
+                return False                           # already too dear: the market ran away
+            intent, px, combined = BUY_SHORT, max(tick, round(1 - cap, 2)), entry.side_price + (1 - book.best_bid)
+        else:                                          # holding Down -> buy Up on the other venue (= buy YES)
+            if book.best_ask is None or book.best_ask > cap + 1e-9:
                 return False
-            combined, intent, px = entry.side_price + (1 - book.best_bid), BUY_SHORT, max(tick, book.best_bid - tick)
-        else:                                          # holding Down -> buy Up on the other venue (= buy YES at its ask)
-            if book.best_ask is None:
-                return False
-            combined, intent, px = entry.side_price + book.best_ask, BUY_LONG, min(1 - tick, book.best_ask + tick)
-        if combined > self.cfg.hedge_max_cost:
-            return False                               # the market already ran away: fall through to wait/unwind
-        self._completed = True
+            intent, px, combined = BUY_LONG, min(1 - tick, round(cap, 2)), entry.side_price + book.best_ask
+        self._hedge_tries += 1
         self.brokers[other].cancel_all()               # drop the resting partner bid so it cannot double-fill
         ok = self.brokers[other].take(intent, px, partner.qty)
-        log.warning("COMPLETE PAIR: holding %s on %s (entry %.3f) -> buying the other side on %s (limit %.2f) | combined ~%.3f %s",
-                    "Up" if net[held] > 0 else "Down", held, entry.side_price, other, px, combined, "sent" if ok else "FAILED")
+        log.warning("COMPLETE PAIR (try %d): holding %s on %s (entry %.3f) -> buy other side on %s, limit %.2f | combined ~%.3f | %s",
+                    self._hedge_tries, "Up" if net[held] > 0 else "Down", held, entry.side_price, other, px, combined,
+                    "FILLED" if ok else "not filled")
         return ok
 
     def _exit_lone_leg(self, net, fair, kb, pb) -> None:

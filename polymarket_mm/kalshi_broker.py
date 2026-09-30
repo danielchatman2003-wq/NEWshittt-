@@ -143,9 +143,12 @@ class KalshiLiveBroker:
             log.warning("[Kalshi] TAKE %s %.4f failed: %s", intent[13:], price, str(e)[:120])
             self._last = 0.0
             return False
-        log.info("[Kalshi LIVE] TAKE  %-10s limit %.4f x%g  filled=%s", intent[13:], price, qty, resp.get("fill_count"))
-        self._pending = (qty if intent in BUYS_YES else -qty, time.monotonic())
+        filled = float(resp.get("fill_count") or 0)
+        log.info("[Kalshi LIVE] TAKE  %-10s limit %.4f x%g  filled=%g", intent[13:], price, qty, filled)
         self._last = 0.0
+        if filled <= 1e-9:
+            return False                                   # IOC found nothing at our limit: do NOT pretend it filled
+        self._pending = (filled if intent in BUYS_YES else -filled, time.monotonic())
         return True
 
     def cancel(self, order_id: str) -> None:

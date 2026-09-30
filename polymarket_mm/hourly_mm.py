@@ -35,7 +35,8 @@ class HourlyConfig:
     skew: float = 0.03            # fair-value shift at max inventory
     react_seconds: float = 5.0    # widen by the fair-value move possible in this long
     pull_frac: float = 0.6        # cancel instantly if fair drifts this fraction of half-spread from what we quoted
-    start_delay: float = 15.0     # no quoting until this long after the window opens (reference price settles)
+    start_delay: float = 900.0    # no quoting for the first 15 min: backtest shows the model is no better than the market there
+                                  # (Brier 0.2368 vs 0.2350) and clearly better later, so early quotes just get picked off
     stop_before_end: float = 150.0  # stop quoting this long before expiry (gamma blows up)
     min_p: float = 0.06           # don't quote near-certain outcomes
     max_p: float = 0.94

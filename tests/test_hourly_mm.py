@@ -401,3 +401,18 @@ def test_resting_order_more_aggressive_than_desired_is_replaced_but_one_tick_pas
     m = _maker([RestingOrder("c", SELL_LONG, 0.32, 1.0)])
     m._reconcile([DesiredQuote(SELL_LONG, 0.30, 1.0)], 0.01, fair=0.30, half=0.02)
     assert m.broker.cancelled == ["c"]
+
+
+def test_quoting_skips_the_weak_first_fifteen_minutes():
+    from polymarket_mm.hourly_mm import HourlyMaker
+    from polymarket_mm.hourly import HourlyMarket
+    m = object.__new__(HourlyMaker)
+    m.cfg = HourlyConfig()
+    m.mkt = HourlyMarket("s", 10_000.0, 13_600.0, 84000.0, 0.01, 0.01, 0.0695, True)
+    m.brti = type("B", (), {"latest": lambda self: object()})()
+    m.book_feed = type("F", (), {"book": lambda self, s: object()})()
+    m.sampler = type("S", (), {"px": {i: 1 for i in range(500)}, "window_avg": lambda self, t: 84000.0})()
+    m._halt_until = 0.0
+    assert m._quoteable(10_000 + 600) == "waiting for window open"      # minute 10: sit out
+    assert m._quoteable(10_000 + 901) is None                            # minute 15+: quote
+    assert m._quoteable(13_600 - 100) == "final minutes"                 # still stops before expiry

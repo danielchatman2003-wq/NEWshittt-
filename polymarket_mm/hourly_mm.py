@@ -57,6 +57,8 @@ class HourlyConfig:
     reentry_block: float = 600.0  # after exiting a direction with the market moved against us, no new entries that way for this long
     max_entries_per_dir: int = 3  # hard cap on entries in one direction per window (loss limiter for one-way trends)
     loss_mark: float = 0.01       # 'moved against us' = fair moved this much against the entry
+    lean: float | None = None     # None: quotes centre on the MODEL's fair value. 0..1: centre on the BOOK's mid and tilt this fraction
+                                  # of the way toward the model (spread-collector: join the touch on both sides, lean second)
     exit_ticks: int = 3           # exits are sticky: keep a resting exit up to this many ticks more passive than desired
     loop_hz: float = 4.0
     max_errors: int = 40          # consecutive failed iterations (~1 min of backoff) before giving up
@@ -185,6 +187,20 @@ def describe(q: DesiredQuote) -> str:
     """Plain-English quote: prices are shown in the price OF THE SIDE being traded (Up or Down)."""
     return {BUY_LONG: f"BID UP {q.price:.2f}", SELL_LONG: f"SELL UP {q.price:.2f}",
             BUY_SHORT: f"BID DOWN {1 - q.price:.2f}", SELL_SHORT: f"SELL DOWN {1 - q.price:.2f}"}[q.intent]
+
+
+# Spread-collector preset (run with --spread): in-and-out at the touch on BOTH sides of the book, leaning with the model second.
+SPREAD_CFG = HourlyConfig(lean=0.3, touch_tol=0.03, start_delay=120.0, exit_hold=8.0, exit_take_after=25.0, exit_slack=0.03,
+                          reentry_block=60.0, max_entries_per_dir=12)
+
+
+def book_view(bk) -> str:
+    """Both views of the one book: Up (bid/ask with sizes) and Down (its mirror image)."""
+    if not bk or bk.best_bid is None or bk.best_ask is None:
+        return "book: --"
+    qb, qa = bk.bids[0][1], bk.asks[0][1]
+    return (f"UP {bk.best_bid:.2f}x{qb:g} / {bk.best_ask:.2f}x{qa:g}  |  "
+            f"DOWN {1 - bk.best_ask:.2f}x{qa:g} / {1 - bk.best_bid:.2f}x{qb:g}")
 
 
 class HourlyMaker:
@@ -379,6 +395,14 @@ class HourlyMaker:
                 self.broker.cancel_all()
                 self._quoted_fair = None
                 return
+            bk = self.book_feed.book(m.slug)
+            fair_q = fair                                          # the price we centre our quotes on
+            if self.cfg.lean is not None and bk and bk.mid is not None:
+                fair_q = bk.mid + self.cfg.lean * (fair - bk.mid)   # book mid, tilted toward the model
+            if not (self.cfg.min_p <= fair_q <= self.cfg.max_p):
+                self.broker.cancel_all()
+                self._quoted_fair = None
+                return
             pos = self.broker.position()
             if self._prev_pos is not None and abs(pos - self._prev_pos) > 1e-9:
                 self._last_fill = now  # position changed => we were just traded against
@@ -405,15 +429,15 @@ class HourlyMaker:
             pad = extra_half(now=now, last_fill=self._last_fill, fair_hist=self._fair_hist, fair=fair, cfg=self.cfg)
             half = self._half(now, spot, sigma, fair) + pad
             self._fair_hist.append((now, fair))
-            want = yes_quotes(fair=fair, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
+            want = yes_quotes(fair=fair_q, half=half, tick=m.tick, pos=pos, cfg=self.cfg, min_qty=m.min_qty,
                               book=(bk.best_bid, bk.best_ask) if bk else None,
                               touch_tol=max(0.0, self.cfg.touch_tol - pad),
                               block_up=self.budget.blocked("up", now), block_down=self.budget.blocked("down", now))
-            self._reconcile(want, m.tick, fair, half)
+            self._reconcile(want, m.tick, fair_q, half)
             self._quoted_fair, self._quoted_half = fair, half
             if now - self._last_log > 5:
-                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | pos %+g (+=Up -=Down) | %s",
-                         m.window_end - now, spot, self._k(), fair, 1 - fair, pos,
+                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | %s | pos %+g (+=Up -=Down) | %s",
+                         m.window_end - now, spot, self._k(), fair, 1 - fair, book_view(bk), pos,
                          "  &  ".join(describe(q) for q in want))
                 self._last_log = now
 
@@ -506,6 +530,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="place REAL orders")
     ap.add_argument("--preview-check", action="store_true")
+    ap.add_argument("--spread", action="store_true", help="spread-collector mode: join the touch on both books, in and out fast")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     load_dotenv()
@@ -523,7 +548,7 @@ def main() -> None:
     rest = UsRest(us) if args.live else None
     if args.live:
         log.warning("LIVE MODE: placing real orders")
-    maker = HourlyMaker(HourlyConfig(), us, brti, sampler, rest)
+    maker = HourlyMaker(SPREAD_CFG if args.spread else HourlyConfig(), us, brti, sampler, rest)
     brti.start()
     # SIGTERM (kill, docker stop, timeout) must cancel resting orders just like Ctrl-C does
     for sig in (signal.SIGINT, signal.SIGTERM):

@@ -601,3 +601,38 @@ def test_no_quoting_in_the_extreme_zones_where_only_one_side_can_fill():
         assert not (cfg.min_p <= f <= cfg.max_p)
     for f in (0.15, 0.5, 0.85):
         assert cfg.min_p <= f <= cfg.max_p
+
+
+# ---- spread-collector mode: join the touch on BOTH books, centre on the book, lean second -------------------------
+def test_spread_mode_joins_the_touch_on_both_sides_when_centred_on_the_book():
+    from polymarket_mm.hourly_mm import SPREAD_CFG
+    cfg = SPREAD_CFG
+    book = (0.20, 0.21)                                   # live snapshot: Up 0.20/0.21 (Down 0.79/0.80), model fair 0.275
+    bk_mid = 0.205
+    fair_q = bk_mid + cfg.lean * (0.275 - bk_mid)         # centre on the book, tilted 30% toward the model
+    q = {x.intent: x for x in yes_quotes(fair=fair_q, half=0.02, tick=0.01, pos=0.0, cfg=cfg, book=book, touch_tol=cfg.touch_tol)}
+    assert abs(q[BUY_LONG].price - 0.20) < 1e-9           # Up bid AT the best Up bid
+    assert abs(q[BUY_SHORT].price - 0.21) < 1e-9          # Down bid AT the best Down bid (= the Up ask): both sides at the touch
+
+
+def test_model_centred_mode_left_the_down_bid_behind_the_book_spread_mode_fixes_it():
+    cfg = HourlyConfig()
+    old = {x.intent: x for x in yes_quotes(fair=0.275, half=0.02, tick=0.01, pos=0.0, cfg=cfg, book=(0.20, 0.21), touch_tol=0.02)}
+    new_fq = 0.205 + 0.3 * (0.275 - 0.205)
+    new = {x.intent: x for x in yes_quotes(fair=new_fq, half=0.02, tick=0.01, pos=0.0, cfg=cfg, book=(0.20, 0.21), touch_tol=0.03)}
+    assert old[BUY_SHORT].price > 0.21                    # old: Down bid behind the touch (priced off the model)
+    assert abs(new[BUY_SHORT].price - 0.21) < 1e-9        # new: at the touch
+
+
+def test_book_view_shows_both_the_up_and_down_books():
+    from polymarket_mm.hourly_mm import book_view
+    from polymarket_mm.us_feed import UsBook
+    v = book_view(UsBook("s", bids=[(0.20, 255)], asks=[(0.21, 55)]))
+    assert "UP 0.20x255 / 0.21x55" in v and "DOWN 0.79x55 / 0.80x255" in v
+    assert book_view(None) == "book: --"
+
+
+def test_spread_preset_is_in_and_out_fast():
+    from polymarket_mm.hourly_mm import SPREAD_CFG
+    assert SPREAD_CFG.exit_take_after <= 30 and SPREAD_CFG.exit_hold <= 10 and SPREAD_CFG.start_delay <= 300
+    assert SPREAD_CFG.size == 1.0 and SPREAD_CFG.max_pos == 1.0        # still one contract at a time

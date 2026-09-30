@@ -7,6 +7,7 @@
 import argparse
 import logging
 import math
+import signal
 import threading
 import time
 from dataclasses import dataclass
@@ -298,10 +299,10 @@ def main() -> None:
         log.warning("LIVE MODE: placing real orders")
     maker = HourlyMaker(HourlyConfig(), us, brti, sampler, rest)
     brti.start()
-    try:
-        maker.run()
-    except KeyboardInterrupt:
-        maker.stop.set()
+    # SIGTERM (kill, docker stop, timeout) must cancel resting orders just like Ctrl-C does
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: maker.stop.set())
+    maker.run()  # its finally-block cancels all quotes on exit
 
 
 if __name__ == "__main__":

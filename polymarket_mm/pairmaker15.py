@@ -35,6 +35,7 @@ class PairConfig:
     start_delay: float = 120.0     # seconds after the window opens before quoting
     stop_before_end: float = 150.0
     leg_timeout: float = 25.0      # how long a lone filled leg waits for its partner before we exit it
+    hedge_max_cost: float = 1.03   # when one leg fills, BUY THE OTHER SIDE AT ONCE (taker) if the pair still costs <= this
     take_slack: float = 0.06       # never take an exit more than this below fair
     min_p: float = 0.10
     max_p: float = 0.90
@@ -142,6 +143,8 @@ class PairMaker:
         self._last_cash = 0.0
         self._equity0: float | None = None
         self.first_fill: float | None = None
+        self._plan_legs: dict = {}      # venue -> the Leg most recently rested there
+        self._completed = False         # already tried to complete the pair for this lone leg
         self.window_done = False   # one attempt per window: after a lone-leg exit we stand down until the next window
         self.total_pnl, self.windows, self.stats = 0.0, 0, {"pairs": 0, "legged": 0, "no_fill": 0}
         self._last_log = 0.0
@@ -198,6 +201,8 @@ class PairMaker:
             self.brokers, self._k_ticker = {}, None      # fresh live brokers per window (per-market tickers/slugs)
         self.first_fill = None
         self.window_done = False
+        self._completed = False
+        self._plan_legs = {}
         log.info("=== window %s (ref %s) ===", nxt.slug[-16:], nxt.price_to_beat)
         return True
 
@@ -260,7 +265,9 @@ class PairMaker:
                     log.info("T-%4.0fs PAIRED %s — holding to settlement (fair %.3f)", m.window_end - now, net, fair)
                     self._last_log = now
                 return
-            if ph == "lone":                                     # 1) one leg filled: wait for the partner, then exit
+            if ph == "lone":                                     # 1) one leg filled: hedge it at once, else wait, then exit
+                if self._try_complete(net, kb, pb):
+                    return
                 if self.first_fill is None:
                     self.first_fill = now
                 if now - self.first_fill >= c.leg_timeout or now > m.window_end - c.stop_before_end:
@@ -311,6 +318,7 @@ class PairMaker:
             _, _, up, dn = plan
             for leg in (up, dn):
                 want[leg.venue] = leg
+                self._plan_legs[leg.venue] = leg
         for v, broker in self.brokers.items():
             have = broker.open_orders()
             leg = want.get(v)
@@ -320,6 +328,38 @@ class PairMaker:
                 broker.cancel(o.id)
             if leg:
                 broker.place(leg.intent, leg.price, leg.qty)
+
+    def _try_complete(self, net, kb, pb) -> bool:
+        """One leg filled: buy the OTHER side right now (IOC taker on the other venue) if the pair still costs
+        <= hedge_max_cost. Both legs then pay exactly $1 whatever happens, so the result is locked (near break-even)
+        instead of an open directional leg. Returns True if the hedge order was sent."""
+        if self._completed:
+            return False
+        held = next((v for v, q in net.items() if abs(q) > 1e-9), None)
+        if held is None:
+            return False
+        other = P if held == K else K
+        entry, partner = self._plan_legs.get(held), self._plan_legs.get(other)
+        book = pb if other == P else kb
+        if not entry or not partner:
+            return False
+        tick = 0.01
+        if net[held] > 0:                              # holding Up -> buy Down on the other venue (= sell YES at its bid)
+            if book.best_bid is None:
+                return False
+            combined, intent, px = entry.side_price + (1 - book.best_bid), BUY_SHORT, max(tick, book.best_bid - tick)
+        else:                                          # holding Down -> buy Up on the other venue (= buy YES at its ask)
+            if book.best_ask is None:
+                return False
+            combined, intent, px = entry.side_price + book.best_ask, BUY_LONG, min(1 - tick, book.best_ask + tick)
+        if combined > self.cfg.hedge_max_cost:
+            return False                               # the market already ran away: fall through to wait/unwind
+        self._completed = True
+        self.brokers[other].cancel_all()               # drop the resting partner bid so it cannot double-fill
+        ok = self.brokers[other].take(intent, px, partner.qty)
+        log.warning("COMPLETE PAIR: holding %s on %s (entry %.3f) -> buying the other side on %s (limit %.2f) | combined ~%.3f %s",
+                    "Up" if net[held] > 0 else "Down", held, entry.side_price, other, px, combined, "sent" if ok else "FAILED")
+        return ok
 
     def _exit_lone_leg(self, net, fair, kb, pb) -> None:
         """Cancel the waiting partner order and exit the filled leg by crossing the spread (IOC) if not absurdly bad."""

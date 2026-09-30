@@ -57,6 +57,7 @@ def make_maker():
     m = object.__new__(PairMaker)
     m.cfg = CFG
     m.brokers = {K: PaperBroker(maker_rebate=-0.0175, taker_fee=0.07), P: PaperBroker()}
+    m._plan_legs, m._completed = {}, False
     return m
 
 
@@ -171,3 +172,46 @@ def test_one_attempt_per_window_after_a_lone_leg_exit():
     m.brokers[K].pos = 1.0
     m._exit_lone_leg({K: 1.0, P: 0.0}, 0.30, book(0.29, 0.30), book(0.29, 0.30))
     assert m.window_done is True
+
+
+# ---- one leg filled -> buy the other side at once ---------------------------------------------------------------
+def maker_with_legs(held_venue, held_intent, held_yes_price, partner_qty=1.0):
+    m = make_maker()
+    m.cfg = PairConfig()
+    other = P if held_venue == K else K
+    m._completed = False
+    m._plan_legs = {held_venue: Leg(held_venue, held_intent, held_yes_price, 1.0),
+                    other: Leg(other, BUY_SHORT if held_intent == BUY_LONG else BUY_LONG, 0.5, partner_qty)}
+    return m, other
+
+
+def test_holding_up_buys_down_on_the_other_venue_when_the_pair_is_still_cheap():
+    m, other = maker_with_legs(K, BUY_LONG, 0.40)                      # long Up on Kalshi at 0.40
+    m.brokers[K].pos = 1.0
+    pb = book(0.59, 0.60)                                               # Polymarket Down costs 1 - 0.59 = 0.41 -> combined 0.81? use realistic:
+    pb = book(0.60, 0.61)                                               # Down = 0.40 -> combined 0.80 (well under $1.03): complete
+    assert m._try_complete({K: 1.0, P: 0.0}, book(0.40, 0.41), pb)
+    assert m.brokers[P].pos == -1.0                                     # now long Down on Polymarket: hedged, both venues hold a leg
+
+
+def test_holding_down_buys_up_on_the_other_venue():
+    m, other = maker_with_legs(P, BUY_SHORT, 0.60)                     # long Down on Polymarket at YES 0.60 => Down 0.40
+    m.brokers[P].pos = -1.0
+    assert m._try_complete({K: 0.0, P: -1.0}, book(0.58, 0.59), book(0.60, 0.61))   # Up on Kalshi costs 0.59: 0.40 + 0.59 = 0.99
+    assert m.brokers[K].pos == 1.0
+
+
+def test_does_not_complete_when_the_market_has_run_away():
+    m, other = maker_with_legs(K, BUY_LONG, 0.40)                      # bought Up at 0.40, market then crashed
+    m.brokers[K].pos = 1.0
+    crashed = book(0.10, 0.11)                                          # Down now costs 0.90: combined 1.30 -> NOT worth completing
+    assert not m._try_complete({K: 1.0, P: 0.0}, book(0.10, 0.11), crashed)
+    assert m.brokers[P].pos == 0.0
+
+
+def test_completion_is_attempted_once_and_partner_size_is_respected():
+    m, other = maker_with_legs(K, BUY_LONG, 0.40, partner_qty=1.0)
+    m.brokers[K].pos = 2.0                                              # a LOADED leg (2 Up)
+    assert m._try_complete({K: 2.0, P: 0.0}, book(0.40, 0.41), book(0.60, 0.61))
+    assert m.brokers[P].pos == -1.0                                     # hedges the partner size only: net +1 Up stays (the lean)
+    assert not m._try_complete({K: 2.0, P: -1.0}, book(0.40, 0.41), book(0.60, 0.61))   # second call: already done

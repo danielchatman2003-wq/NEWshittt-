@@ -105,3 +105,18 @@ def test_up_and_down_are_exactly_symmetric():
     # buying Up at x is the mirror of buying Down at x: bid(Up)@0.68 <-> ask side BUY_SHORT@0.32 -> Down price 0.68
     assert abs(a[BUY_LONG].price - (1 - b[BUY_SHORT].price)) < 1e-9
     assert abs(a[BUY_SHORT].price - (1 - b[BUY_LONG].price)) < 1e-9
+
+
+def test_dead_even_market_quotes_dead_even_even_with_float_dust():
+    for fair in (0.5, 0.5 + 4e-10, 0.5 - 4e-10):
+        r = {x.intent: x for x in yes_quotes(fair=fair, half=0.02, tick=0.01, pos=0, cfg=CFG)}
+        up_bid, down_bid = r[BUY_LONG].price, 1 - r[BUY_SHORT].price
+        assert abs(up_bid - down_bid) < 1e-9, (fair, up_bid, down_bid)
+
+
+def test_mirrored_fair_values_give_mirrored_quotes_across_the_range():
+    for f in (0.07, 0.13, 0.26, 0.41, 0.5, 0.62, 0.78, 0.93):
+        a = {x.intent: x for x in yes_quotes(fair=f, half=0.02, tick=0.01, pos=0, cfg=CFG)}
+        b = {x.intent: x for x in yes_quotes(fair=1 - f, half=0.02, tick=0.01, pos=0, cfg=CFG)}
+        assert abs(a[BUY_LONG].price - (1 - b[BUY_SHORT].price)) < 1e-9, f
+        assert abs(a[BUY_SHORT].price - (1 - b[BUY_LONG].price)) < 1e-9, f

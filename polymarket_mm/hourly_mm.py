@@ -57,7 +57,8 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
        bid side: SELL_SHORT (close NO) if pos<0 else BUY_LONG;   ask side: SELL_LONG if pos>0 else BUY_SHORT."""
     t = _d(tick)
     skew = max(-1.0, min(1.0, pos / cfg.max_pos)) if cfg.max_pos > 0 else 0.0
-    center = _d(fair) - _d(cfg.skew) * _d(skew)  # long inventory -> quote lower, want to sell
+    # round away float dust (e.g. 0.50000000004) so a dead-even market quotes dead-even, not tilted a tick toward Up
+    center = _d(round(fair, 6)) - _d(cfg.skew) * _d(skew)  # long inventory -> quote lower, want to sell
     bid = _floor(center - _d(half), t)
     ask = _ceil(center + _d(half), t)
     if bid < t or ask > 1 - t or bid >= ask:
@@ -72,6 +73,12 @@ def yes_quotes(*, fair: float, half: float, tick: float, pos: float, cfg: Hourly
     elif cfg.max_pos + pos >= min_qty:
         out.append(DesiredQuote(BUY_SHORT, float(ask), min(cfg.size, cfg.max_pos + pos)))
     return out
+
+
+def describe(q: DesiredQuote) -> str:
+    """Plain-English quote: prices are shown in the price OF THE SIDE being traded (Up or Down)."""
+    return {BUY_LONG: f"BID UP {q.price:.2f}", SELL_LONG: f"SELL UP {q.price:.2f}",
+            BUY_SHORT: f"BID DOWN {1 - q.price:.2f}", SELL_SHORT: f"SELL DOWN {1 - q.price:.2f}"}[q.intent]
 
 
 class HourlyMaker:
@@ -237,9 +244,9 @@ class HourlyMaker:
                             self._reconcile(want, m.tick)
                             self._quoted_fair, self._quoted_half = fair, half
                             if now - last_log > 5:
-                                log.info("T-%4.0fs BRTI=%.2f K=%.2f fair=%.3f half=%.3f pos=%+g quotes=%s", m.window_end - now,
-                                         spot, self._k(), fair, half, self.broker.position(),
-                                         [(q.intent[13:], q.price) for q in want])
+                                log.info("T-%4.0fs BRTI=%.2f ref=%.2f | fair UP %.3f / DOWN %.3f | pos %+g (+=Up -=Down) | %s",
+                                         m.window_end - now, spot, self._k(), fair, 1 - fair, self.broker.position(),
+                                         "  &  ".join(describe(q) for q in want))
                                 last_log = now
                         else:
                             self.broker.cancel_all()
